@@ -5,7 +5,7 @@
 ## Requirements
 
 - A Linux host (tested on Ubuntu 24.04) with rootless Docker for an unprivileged user, `uidmap`, lingering on, and Python 3. [`docs/vps-setup.md`](../docs/vps-setup.md) describes such a server.
-- nc-harness checked out at `~/projects/personal/nc-harness` and installed (`./install.sh`). `nc-work` calls its `bin/nc` on the host for model policy, agent files, memory and delegation.
+- nc-harness cloned at exactly `~/projects/personal/nc-harness` and installed (`./install.sh`). The path is fixed (`HARNESS` in `bin/nc-work`); a checkout anywhere else is not found. `nc-work` calls its `bin/nc` on the host for model policy, agent files, memory and delegation.
 - Projects as Git checkouts below `~/projects`, one profile per project.
 - For OpenCode: OpenRouter keys in `~/.config/nc-harness/secrets.env` (see nc-harness). For Claude: a Claude subscription (`nc-work auth-login`).
 

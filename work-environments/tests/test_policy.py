@@ -195,7 +195,7 @@ class OpenCodeTests(unittest.TestCase):
              patch.object(mod.sys.stdout, 'isatty', return_value=stdout_tty), \
              patch.object(mod, 'container_state', return_value=state), \
              patch.object(mod.subprocess, 'run', side_effect=fake):
-            try: mod.opencode(online(m or {'project': 'example-site', 'id': 'pw-task'}), args, stdin)
+            try: mod.opencode(online(m or {'project': 'example-site', 'id': 'site-task'}), args, stdin)
             finally: self.calls = calls
         return self.main()
 
@@ -215,7 +215,7 @@ class OpenCodeTests(unittest.TestCase):
         self.assertNotIn('sk-or-synthetic-test', ' '.join(kwargs['env'].values()))
         self.assertEqual(self.key(), 'sk-or-synthetic-test')                      # the key goes to the proxy only
         self.assertNotIn('synthetic-other', ' '.join(kwargs['env'].values()))
-        self.assertEqual(argv[argv.index('ncw-pw-task') + 1:], ['/usr/local/bin/opencode', 'run', '--model', 'openrouter/x/y', 'hello'])
+        self.assertEqual(argv[argv.index('ncw-site-task') + 1:], ['/usr/local/bin/opencode', 'run', '--model', 'openrouter/x/y', 'hello'])
         self.assertNotIn('-i', argv); self.assertNotIn('-it', argv)                 # no input unless asked for
 
     def test_piped_input_only_on_request(self):
@@ -225,7 +225,7 @@ class OpenCodeTests(unittest.TestCase):
 
     def test_stopped_task_is_not_called_missing_opencode_and_gets_no_key(self):
         self.write('OPENROUTER_API_KEY=sk-or-x\n')
-        with self.assertRaisesRegex(ValueError, 'is not running: nc-work start pw-task'): self.run_opencode(state='stopped')
+        with self.assertRaisesRegex(ValueError, 'is not running: nc-work start site-task'): self.run_opencode(state='stopped')
         self.assertEqual(self.main(), (None, None)); self.assertEqual(self.reaped(), []); self.assertEqual(self.kp.started, [])
 
     def test_ignored_sighup_stays_ignored(self):
@@ -251,7 +251,7 @@ class OpenCodeTests(unittest.TestCase):
                 if is_policy_call(cmd): return Mock(returncode=0, stdout=policy_json(), stderr=b'')
                 return Mock(returncode=1 if mod.OPENCODE_REAP in cmd else 0)
             with patch.object(mod.sys.stdin, 'isatty', return_value=False), patch.object(mod.subprocess, 'run', side_effect=fake):
-                mod.opencode(online({'project': 'example-site', 'id': 'pw-task'}), ['run', 'x'])
+                mod.opencode(online({'project': 'example-site', 'id': 'site-task'}), ['run', 'x'])
         self.assertEqual(err.getvalue(), '')
 
     def test_terminal_flags(self):
@@ -267,7 +267,7 @@ class OpenCodeTests(unittest.TestCase):
         marker = next(a for a in argv if a.startswith('NC_OPENCODE_RUN='))
         reap = self.reaped()
         self.assertEqual(len(reap), 1)
-        self.assertEqual(reap[0][:3], ['docker', 'exec', 'ncw-pw-task'])
+        self.assertEqual(reap[0][:3], ['docker', 'exec', 'ncw-site-task'])
         self.assertEqual(reap[0][-1], marker.split('=', 1)[1])
         for dying in (KeyboardInterrupt(), SystemExit(143)):
             with self.assertRaises(type(dying)): self.run_opencode(['run', 'x'], main_effect=dying)
@@ -330,7 +330,7 @@ class OpenCodeTests(unittest.TestCase):
 
     # --- the key by the project's policy, default and title model
     BOTH = 'OPENROUTER_API_KEY=sk-or-default-synthetic\nOPENROUTER_API_KEY_CLIENTS=sk-or-clients-synthetic\n'
-    CLIENT = {'project': 'example-client', 'id': 'vw-task', 'project_path': 'clients/acme/website'}
+    CLIENT = {'project': 'example-client', 'id': 'acme-task', 'project_path': 'clients/acme/website'}
     FREE_DENIED = (0, policy_json(deny=['free']), b'')
 
     def docker_calls(self):
@@ -437,7 +437,7 @@ class OpenCodeTests(unittest.TestCase):
                 self.assertEqual(json.loads(kwargs['env']['OPENCODE_CONFIG_CONTENT']), expected)
                 self.assertEqual(kwargs['env']['OPENCODE_CONFIG_CONTENT'], json.dumps(expected, separators=(',', ':')))
                 self.assertFalse(any('openrouter/acme' in a for a in argv))
-                self.assertEqual(argv[argv.index('ncw-pw-task') + 1:], ['/usr/local/bin/opencode', 'run', 'x'])
+                self.assertEqual(argv[argv.index('ncw-site-task') + 1:], ['/usr/local/bin/opencode', 'run', 'x'])
 
     def test_tmpdir_is_an_executable_folder_made_before_the_start(self):
         self.write(self.BOTH)
@@ -447,7 +447,7 @@ class OpenCodeTests(unittest.TestCase):
         started = next(i for i, (c, _) in enumerate(self.calls) if '/usr/local/bin/opencode' in c)
         self.assertEqual(len(made), 1)
         self.assertLess(made[0], started)
-        self.assertEqual(self.calls[made[0]][0], ['docker', 'exec', '--user', '1000:1000', 'ncw-pw-task',
+        self.assertEqual(self.calls[made[0]][0], ['docker', 'exec', '--user', '1000:1000', 'ncw-site-task',
                                                   '/usr/bin/mkdir', '-p', '-m', '700', '/home/agent/.cache/nc-tmp'])
         self.assertEqual(argv[argv.index('TMPDIR') - 1], '-e')                       # by name, like the key
         self.assertEqual(kwargs['env']['TMPDIR'], '/home/agent/.cache/nc-tmp')
@@ -457,8 +457,8 @@ class OpenCodeTests(unittest.TestCase):
             if '/usr/bin/mkdir' in cmd: return Mock(returncode=1, stdout=b'', stderr=b'mkdir: cannot create directory\n')
             return Mock(returncode=0, stdout=b'', stderr=b'')
         with patch.object(mod, 'container_state', return_value='running'), patch.object(mod.subprocess, 'run', side_effect=failing) as call:
-            with self.assertRaisesRegex(ValueError, '^/home/agent/.cache/nc-tmp not created in task pw-task \\(mkdir: cannot create directory\\) – OpenCode does not start$'):
-                mod.opencode(online({'project': 'example-site', 'id': 'pw-task'}), ['run', 'x'])
+            with self.assertRaisesRegex(ValueError, '^/home/agent/.cache/nc-tmp not created in task site-task \\(mkdir: cannot create directory\\) – OpenCode does not start$'):
+                mod.opencode(online({'project': 'example-site', 'id': 'site-task'}), ['run', 'x'])
         self.assertFalse(any('/usr/local/bin/opencode' in a.args[0] for a in call.call_args_list))
 
     def test_same_parsing_rule_for_the_clients_key(self):
@@ -505,7 +505,7 @@ class KeyProxyLaunchTests(unittest.TestCase):
         secrets = root / 'secrets.env'; secrets.write_text(f'OPENROUTER_API_KEY={self.KEY}\n'); secrets.chmod(0o600)
         for p in [patch.object(mod, 'STATE', self.state), patch.object(mod, 'SECRETS', secrets)]:
             p.start(); self.addCleanup(p.stop)
-        self.m = online({'project': 'example-site', 'id': 'pw-task'})
+        self.m = online({'project': 'example-site', 'id': 'site-task'})
 
     def launch(self, main=0, popen_effect=None, exits=False, ready=True, proxies='', live='', during=None, m=None):
         """nc-work opencode with Docker faked at the subprocess level. Sets self.calls (('run'|'popen', argv, kw)),
@@ -553,11 +553,11 @@ class KeyProxyLaunchTests(unittest.TestCase):
     def test_every_docker_exec_starts_its_program_by_absolute_path(self):
         # ~/.local/bin comes first on the container's PATH and the agent writes there: a python3 of its own must not
         # answer the live search or the clean-up.
-        self.launch(proxies=f'ncw-pw-task-key-{self.RUN_A} {self.RUN_A}\n')
+        self.launch(proxies=f'ncw-site-task-key-{self.RUN_A} {self.RUN_A}\n')
         live = next(c for c in self.runs() if mod.OPENCODE_LIVE in c)
         reap = next(c for c in self.runs() if mod.OPENCODE_REAP in c)
-        self.assertEqual(live[:4], ['docker', 'exec', 'ncw-pw-task', '/usr/bin/python3'])
-        self.assertEqual(reap[:4], ['docker', 'exec', 'ncw-pw-task', '/usr/bin/python3'])
+        self.assertEqual(live[:4], ['docker', 'exec', 'ncw-site-task', '/usr/bin/python3'])
+        self.assertEqual(reap[:4], ['docker', 'exec', 'ncw-site-task', '/usr/bin/python3'])
         execs = [c for c in self.runs() if c[:2] == ['docker', 'exec']]
         self.assertGreaterEqual(len(execs), 5)                                     # ready, mkdir, live, ping, opencode, reap
         for c in execs:
@@ -578,11 +578,11 @@ class KeyProxyLaunchTests(unittest.TestCase):
         run_id = self.own()[-16:]
         self.assertRegex(run_id, '^[0-9a-f]{16}$')
         self.assertEqual(argv[:3], ['docker', 'run', '-i'])
-        self.assertEqual(self.own(), f'ncw-pw-task-key-{run_id}')
+        self.assertEqual(self.own(), f'ncw-site-task-key-{run_id}')
         def after(flag): return [argv[i + 1] for i, a in enumerate(argv) if a == flag]
         self.assertEqual(after('--label'), [f'{mod.LABEL}.kind=keyproxy', f'{mod.LABEL}.project=example-site',
-                                            f'{mod.LABEL}.task=pw-task', f'{mod.LABEL}.run={run_id}'])
-        self.assertEqual((after('--network'), after('--network-alias')), (['ncw-pw-task'], [f'key-{run_id}']))
+                                            f'{mod.LABEL}.task=site-task', f'{mod.LABEL}.run={run_id}'])
+        self.assertEqual((after('--network'), after('--network-alias')), (['ncw-site-task'], [f'key-{run_id}']))
         for flag, value in [('--user', '1000:1000'), ('--cap-drop', 'ALL'), ('--security-opt', 'no-new-privileges'),
                             ('--memory', '256m'), ('--pids-limit', '64'), ('--ulimit', 'core=0'), ('--entrypoint', '/usr/bin/python3')]:
             self.assertEqual(after(flag), [value], flag)
@@ -640,7 +640,7 @@ class KeyProxyLaunchTests(unittest.TestCase):
                 reaped = [i for i, c in enumerate(self.runs()) if mod.OPENCODE_REAP in c]
                 removed = [i for i, c in enumerate(self.runs()) if c[:4] == ['docker', 'rm', '-f', name]]
                 self.assertLess(removed[0], reaped[0])                              # the proxy first, then the processes
-                self.assertFalse((self.state / 'keyproxy-runs' / f'pw-task.{name[-16:]}.lock').exists())
+                self.assertFalse((self.state / 'keyproxy-runs' / f'site-task.{name[-16:]}.lock').exists())
         self.assertEqual({s: mod.signal.getsignal(s) for s in before}, before)    # handlers restored
 
     def test_a_signal_right_after_docker_run_still_ends_it_and_a_failed_removal_is_reported(self):
@@ -675,43 +675,43 @@ class KeyProxyLaunchTests(unittest.TestCase):
     def test_no_proxy_no_opencode(self):
         for label, kw in [('docker run ended', dict(exits=True)), ('no answer within 15 seconds', dict(ready=False))]:
             with self.subTest(label):
-                with self.assertRaisesRegex(ValueError, 'key proxy for pw-task not ready – OpenCode does not start'): self.launch(**kw)
+                with self.assertRaisesRegex(ValueError, 'key proxy for site-task not ready – OpenCode does not start'): self.launch(**kw)
                 self.assertEqual(self.main_call(), (None, None))
                 self.assertIn(self.own(), self.removed())
         pings = [c for c in self.runs() if mod.KEYPROXY_PING in c]
         self.assertTrue(1 < len(pings) <= 16)                                       # retried until the deadline, not beyond
 
     def test_offline_tasks_get_no_opencode_and_no_key_is_read(self):
-        for m in [{'project': 'example-site', 'id': 'pw-off', 'network': 'none', 'proxy': None},
-                  {'project': 'example-site', 'id': 'pw-off'}]:
+        for m in [{'project': 'example-site', 'id': 'site-off', 'network': 'none', 'proxy': None},
+                  {'project': 'example-site', 'id': 'site-off'}]:
             with self.subTest(m=m), patch.object(mod, 'openrouter_key') as key:
                 with self.assertRaisesRegex(ValueError, '^offline: no OpenCode'): self.launch(m=m)
                 key.assert_not_called(); self.assertEqual(self.calls, [])
 
     def test_orphans_go_at_the_start_but_not_the_proxy_of_a_live_run(self):
         lock_dir = self.state / 'keyproxy-runs'; lock_dir.mkdir(parents=True)
-        held = (lock_dir / f'pw-task.{self.RUN_C}.lock').open('a'); self.addCleanup(held.close)
+        held = (lock_dir / f'site-task.{self.RUN_C}.lock').open('a'); self.addCleanup(held.close)
         mod.fcntl.flock(held, mod.fcntl.LOCK_EX)                                    # a run whose OpenCode is not up yet
-        proxies = ''.join(f'ncw-pw-task-key-{r} {r}\n' for r in (self.RUN_A, self.RUN_B, self.RUN_C))
+        proxies = ''.join(f'ncw-site-task-key-{r} {r}\n' for r in (self.RUN_A, self.RUN_B, self.RUN_C))
         self.launch(proxies=proxies, live=self.RUN_B + '\n')
         removed = self.removed()
-        self.assertEqual(removed[0], f'ncw-pw-task-key-{self.RUN_A}')              # no process, no lock: orphan
-        self.assertNotIn(f'ncw-pw-task-key-{self.RUN_B}', removed)                # live process with its marker
-        self.assertNotIn(f'ncw-pw-task-key-{self.RUN_C}', removed)                # nc-work of that run still holds its lock
+        self.assertEqual(removed[0], f'ncw-site-task-key-{self.RUN_A}')              # no process, no lock: orphan
+        self.assertNotIn(f'ncw-site-task-key-{self.RUN_B}', removed)                # live process with its marker
+        self.assertNotIn(f'ncw-site-task-key-{self.RUN_C}', removed)                # nc-work of that run still holds its lock
         sweep = next(c for c in self.runs() if c[:3] == ['docker', 'ps', '-a'])
-        self.assertIn(f'label={mod.LABEL}.task=pw-task', sweep); self.assertIn(f'label={mod.LABEL}.kind=keyproxy', sweep)
+        self.assertIn(f'label={mod.LABEL}.task=site-task', sweep); self.assertIn(f'label={mod.LABEL}.kind=keyproxy', sweep)
         live = next(c for c in self.runs() if mod.OPENCODE_LIVE in c)
-        self.assertEqual(live[:3], ['docker', 'exec', 'ncw-pw-task'])
+        self.assertEqual(live[:3], ['docker', 'exec', 'ncw-site-task'])
         idx = {kind: i for i, (kind, c, _) in enumerate(self.calls) if kind == 'popen' or c[:3] == ['docker', 'ps', '-a']}
         self.assertLess(idx['run'], idx['popen'])                                  # swept before the own proxy starts
 
     def test_unknown_liveness_keeps_every_proxy(self):
-        proxies = f'ncw-pw-task-key-{self.RUN_A} {self.RUN_A}\n'
+        proxies = f'ncw-site-task-key-{self.RUN_A} {self.RUN_A}\n'
         def fake(cmd, **kw):
             if cmd[:3] == ['docker', 'ps', '-a']: return Mock(returncode=0, stdout=proxies.encode())
             return Mock(returncode=1, stdout=b'')                                   # the live search fails
         with patch.object(mod.subprocess, 'run', side_effect=fake) as call, patch.object(mod.sys, 'stderr', new_callable=io.StringIO) as err:
-            mod.keyproxy_sweep('pw-task', orphans_only=True)
+            mod.keyproxy_sweep('site-task', orphans_only=True)
         self.assertFalse(any(c.args[0][:2] == ['docker', 'rm'] for c in call.call_args_list))
         self.assertIn('not checked', err.getvalue())
 
@@ -723,7 +723,7 @@ class KeyProxyLaunchTests(unittest.TestCase):
         self.assertTrue(mod.OPENCODE_REAP.startswith(mod.OPENCODE_RUNS)); self.assertTrue(mod.OPENCODE_LIVE.startswith(mod.OPENCODE_RUNS))
 
     def sweep_all(self, call):
-        proxies = f'ncw-pw-task-key-{self.RUN_A} {self.RUN_A}\nncw-pw-task-key-{self.RUN_B} {self.RUN_B}\n'
+        proxies = f'ncw-site-task-key-{self.RUN_A} {self.RUN_A}\nncw-site-task-key-{self.RUN_B} {self.RUN_B}\n'
         calls = []
         def fake(cmd, **kw):
             calls.append(list(map(str, cmd)))
@@ -733,29 +733,29 @@ class KeyProxyLaunchTests(unittest.TestCase):
         return [c[3] for c in calls if c[:3] == ['docker', 'rm', '-f']], calls
 
     def test_stop_and_make_room_remove_every_proxy_of_the_task(self):
-        mod.save(self.state / 'tasks/pw-task.json', dict(self.m, status='ready'))
-        with patch.object(mod.sys, 'argv', ['nc-work', 'stop', 'pw-task']):
+        mod.save(self.state / 'tasks/site-task.json', dict(self.m, status='ready'))
+        with patch.object(mod.sys, 'argv', ['nc-work', 'stop', 'site-task']):
             removed, calls = self.sweep_all(mod.main)
-        self.assertEqual(removed, [f'ncw-pw-task-key-{self.RUN_A}', f'ncw-pw-task-key-{self.RUN_B}'])
+        self.assertEqual(removed, [f'ncw-site-task-key-{self.RUN_A}', f'ncw-site-task-key-{self.RUN_B}'])
         self.assertFalse(any(mod.OPENCODE_LIVE in c for c in calls))               # all of them, no live search
-        with patch.object(mod, 'running_agents', return_value=['pw-task', 'b', 'c']), patch('builtins.input', return_value='1'), \
+        with patch.object(mod, 'running_agents', return_value=['site-task', 'b', 'c']), patch('builtins.input', return_value='1'), \
              patch.object(mod.sys, 'stdout', new_callable=io.StringIO):
             removed, _ = self.sweep_all(mod.make_room)
-        self.assertEqual(removed, [f'ncw-pw-task-key-{self.RUN_A}', f'ncw-pw-task-key-{self.RUN_B}'])
+        self.assertEqual(removed, [f'ncw-site-task-key-{self.RUN_A}', f'ncw-site-task-key-{self.RUN_B}'])
 
     def test_remove_takes_the_proxies_through_the_task_label(self):
-        mod.save(self.state / 'tasks/pw-task.json', dict(self.m, status='ready'))
+        mod.save(self.state / 'tasks/site-task.json', dict(self.m, status='ready'))
         calls = []
         def fake(cmd, **kw):
             cmd = list(map(str, cmd)); calls.append(cmd)
-            if cmd[:3] == ['docker', 'ps', '-aq'] and f'label={mod.LABEL}.task=pw-task' in cmd:
+            if cmd[:3] == ['docker', 'ps', '-aq'] and f'label={mod.LABEL}.task=site-task' in cmd:
                 return Mock(returncode=0, stdout=b'agentid\nproxyid\n', stderr=b'')
             if cmd[:2] == ['docker', 'version']: return Mock(returncode=0, stdout=b'', stderr=b'')
             return Mock(returncode=1, stdout=b'', stderr=b'')
         locks = self.state / 'keyproxy-runs'; locks.mkdir()
-        for n in (f'pw-task.{self.RUN_A}.lock', f'other.{self.RUN_B}.lock'): (locks / n).touch()  # one left after a SIGKILL
+        for n in (f'site-task.{self.RUN_A}.lock', f'other.{self.RUN_B}.lock'): (locks / n).touch()  # one left after a SIGKILL
         with patch.object(mod.subprocess, 'run', side_effect=fake), patch.object(mod.sys, 'stdout', new_callable=io.StringIO):
-            mod.remove('pw-task', force=True)
+            mod.remove('site-task', force=True)
         self.assertEqual(sorted(c[3] for c in calls if c[:3] == ['docker', 'rm', '-f']), ['agentid', 'proxyid'])
         self.assertEqual([p.name for p in locks.iterdir()], [f'other.{self.RUN_B}.lock'])  # only this task's lock files go
 
@@ -817,17 +817,17 @@ class HereTests(unittest.TestCase):
         return run, create, claude
 
     def test_existing_running_task_is_reused_without_new_container(self):
-        self.add_task('pw-layout', 'example-site')
+        self.add_task('site-layout', 'example-site')
         self.add_task('other', 'example-client')
-        run, create, claude = self.run_here(['1'], states={'pw-layout': 'running', 'other': 'running'})
+        run, create, claude = self.run_here(['1'], states={'site-layout': 'running', 'other': 'running'})
         create.assert_not_called(); run.assert_not_called()
-        self.assertEqual(claude.call_args[0][0]['id'], 'pw-layout')
+        self.assertEqual(claude.call_args[0][0]['id'], 'site-layout')
 
     def test_runtime_opencode_starts_opencode_instead_of_claude(self):
-        self.add_task('pw-layout', 'example-site', opencode=True)
-        run, create, claude = self.run_here(['1'], states={'pw-layout': 'running'}, runtime='opencode')
+        self.add_task('site-layout', 'example-site', opencode=True)
+        run, create, claude = self.run_here(['1'], states={'site-layout': 'running'}, runtime='opencode')
         claude.assert_not_called()
-        self.assertEqual(self.opencode.call_args[0][0]['id'], 'pw-layout')
+        self.assertEqual(self.opencode.call_args[0][0]['id'], 'site-layout')
 
     def test_runtime_opencode_does_not_offer_tasks_without_opencode(self):
         self.add_task('old-task', 'example-site')                     # older image/snapshot, no flag
@@ -874,16 +874,16 @@ class HereTests(unittest.TestCase):
         typed.assert_not_called(); create.assert_not_called(); started.assert_not_called()
 
     def test_runtime_opencode_asks_the_policy_of_the_chosen_profile(self):
-        self.add_task('pw-layout', 'example-site', opencode=True)
-        self.run_here(['1'], states={'pw-layout': 'running'}, runtime='opencode')
+        self.add_task('site-layout', 'example-site', opencode=True)
+        self.run_here(['1'], states={'site-layout': 'running'}, runtime='opencode')
         self.policy_asked.assert_called_once_with('sites/example-site')
 
     def test_stopped_task_is_started_with_its_proxy(self):
-        self.add_task('pw-layout', 'example-site')
-        run, create, claude = self.run_here(['1'], states={'pw-layout': 'stopped'})
+        self.add_task('site-layout', 'example-site')
+        run, create, claude = self.run_here(['1'], states={'site-layout': 'stopped'})
         started = [c.args for c in run.call_args_list]
-        self.assertEqual(started, [('docker', 'start', 'ncw-pw-layout-egress'), ('docker', 'start', 'ncw-pw-layout')])
-        self.assertEqual(claude.call_args[0][0]['id'], 'pw-layout')
+        self.assertEqual(started, [('docker', 'start', 'ncw-site-layout-egress'), ('docker', 'start', 'ncw-site-layout')])
+        self.assertEqual(claude.call_args[0][0]['id'], 'site-layout')
 
     def test_enter_twice_creates_a_task_with_the_suggested_name(self):
         run, create, claude = self.run_here(['', ''])
@@ -903,10 +903,10 @@ class HereTests(unittest.TestCase):
 
     def test_full_server_asks_which_task_to_stop(self):
         for n in ['a1', 'a2', 'a3']: self.add_task(n, 'example-client')
-        run, create, claude = self.run_here(['n', 'pw-new', '2'], running=['a1', 'a2', 'a3'])
+        run, create, claude = self.run_here(['n', 'site-new', '2'], running=['a1', 'a2', 'a3'])
         stopped = [c.args for c in run.call_args_list]
         self.assertEqual(stopped, [('docker', 'stop', 'ncw-a2'), ('docker', 'stop', 'ncw-a2-egress')])
-        self.assertEqual(create.call_args[0][1], 'pw-new')
+        self.assertEqual(create.call_args[0][1], 'site-new')
 
 class FeedTests(unittest.TestCase):
     """`nc-work feed`: herdr's usage cards find the isolated session behind a terminal."""
@@ -925,18 +925,18 @@ class FeedTests(unittest.TestCase):
             return Mock(returncode=0)
         with patch.object(mod, 'dex'), patch.object(mod.sys.stdin, 'isatty', return_value=True), \
              patch.object(mod.subprocess, 'run', side_effect=fake_run):
-            mod.claude({'project': 'example-site', 'id': 'pw-task'})
+            mod.claude({'project': 'example-site', 'id': 'site-task'})
         self.assertIn(f'NC_HOST_PID={mod.os.getpid()}', seen['cmd'])
-        self.assertEqual(seen['marker']['task'], 'pw-task')
+        self.assertEqual(seen['marker']['task'], 'site-task')
         self.assertFalse((self.state / f'sessions/{mod.os.getpid()}.json').exists())
 
     def test_session_found_from_the_shell_above_or_the_process_below(self):
         import subprocess as sp
-        mod.save(self.state / f'sessions/{mod.os.getpid()}.json', {'task': 'pw-task'})
+        mod.save(self.state / f'sessions/{mod.os.getpid()}.json', {'task': 'site-task'})
         child = sp.Popen(['sleep', '30']); self.addCleanup(child.kill)
-        self.assertEqual(mod.session_of(child.pid), ('pw-task', mod.os.getpid()))        # docker child
-        self.assertEqual(mod.session_of(mod.os.getppid()), ('pw-task', mod.os.getpid())) # starting shell
-        self.assertEqual(mod.session_of(mod.os.getpid()), ('pw-task', mod.os.getpid()))  # nc-work itself
+        self.assertEqual(mod.session_of(child.pid), ('site-task', mod.os.getpid()))        # docker child
+        self.assertEqual(mod.session_of(mod.os.getppid()), ('site-task', mod.os.getpid())) # starting shell
+        self.assertEqual(mod.session_of(mod.os.getpid()), ('site-task', mod.os.getpid()))  # nc-work itself
 
     def test_unrelated_process_and_dead_markers(self):
         import subprocess as sp
@@ -947,19 +947,19 @@ class FeedTests(unittest.TestCase):
         self.assertFalse((self.state / f'sessions/{dead.pid}.json').exists())
 
     def test_feed_runs_the_script_inside_the_task_container_only(self):
-        mod.save(self.state / f'sessions/{mod.os.getpid()}.json', {'task': 'pw-task'})
+        mod.save(self.state / f'sessions/{mod.os.getpid()}.json', {'task': 'site-task'})
         with patch.object(mod.subprocess, 'run', return_value=Mock(returncode=0, stdout=b'{"v": 1}', stderr=b'')) as run, \
              patch('sys.stdout', new_callable=io.StringIO) as out:
             mod.feed(mod.os.getpid(), 'print(1)', ['--since', 'abc'])
         cmd = run.call_args[0][0]
-        self.assertEqual(cmd[:3], ['docker', 'exec', 'ncw-pw-task'])
+        self.assertEqual(cmd[:3], ['docker', 'exec', 'ncw-site-task'])
         self.assertEqual(cmd[-4:], [str(mod.os.getpid()), 'print(1)', '--since', 'abc'])
         self.assertNotIn('-it', cmd)
         self.assertEqual(out.getvalue(), '{"v": 1}')
 
     def test_feed_passes_orch_before_since(self):
         for extra, want in [(['--orch'], ['--orch', '--since', 'abc']), ([], ['--since', 'abc'])]:
-            with patch.object(mod, 'session_of', return_value=('pw-task', 4242)), \
+            with patch.object(mod, 'session_of', return_value=('site-task', 4242)), \
                  patch.object(mod.subprocess, 'run', return_value=Mock(returncode=0, stdout=b'{}', stderr=b'')) as run, \
                  patch.object(mod.sys, 'argv', ['nc-work', 'feed', '--pid', '7', '--script=print(1)', *extra, '--since=abc']), \
                  patch('sys.stdout', new_callable=io.StringIO):
@@ -2251,7 +2251,7 @@ class BrokerTests(unittest.TestCase):
         a = self.answer('big'); self.assertEqual((a['state'], a['reason']), ('refused', 'request larger than 64 KiB'))
         self.assertEqual(self.calls, []); self.assertFalse((self.dirs()[0] / 'big.json').exists())
         data = b'{"x":"' + b'a' * (64 * 1024 - 8) + b'"}'; self.assertEqual(len(data), 64 * 1024)
-        self.put('edge.json', data); self.round(lambda cmd: FakeProc(line(state='refused', reason='Rolle'), code=1)); self.assertEqual(len(self.calls), 1)
+        self.put('edge.json', data); self.round(lambda cmd: FakeProc(line(state='refused', reason='role'), code=1)); self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0][2][0][1], data)
 
     def test_the_mailbox_keeps_eight_files_and_four_requests_are_read_per_round(self):

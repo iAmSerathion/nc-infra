@@ -47,7 +47,7 @@
     "memory_gib": 4,
     "pids": 512
   },
-  "notes": "Fresh task DB/cache required; existing shared development containers are not attached. Shared build step is still manual.",
+  "notes": "Example note: fresh task DB/cache; shared development containers are not attached.",
   "local_services": {
     "postgres": {
       "image": "postgres:15-alpine",

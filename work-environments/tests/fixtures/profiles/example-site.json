@@ -44,6 +44,6 @@
     "memory_gib": 4,
     "pids": 512
   },
-  "notes": "Database and schema changes stay with the hosted builder.",
+  "notes": "Example note: run the build before publishing.",
   "local_services": {}
 }

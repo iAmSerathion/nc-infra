@@ -353,7 +353,7 @@ Limits:
 
 In the image: OpenCode 2.2.7, the same file that `nc-harness` installs on the host (standalone binary from the GitHub release, `images/opencode.sha256`). `OPENCODE_DISABLE_AUTOUPDATE=1` and `OPENCODE_DISABLE_MODELS_FETCH=1`: no self-update, model catalog from the built-in state, because `models.opencode.ai` is not allowed. Only the provider `openrouter` is allowed (configuration from the harness).
 
-Checked in a fresh task: skill `nc-harness-check` loaded in Claude and OpenCode, key neither in `docker inspect` nor in PID 1. After a normal run and after a hard abort (`timeout -s TERM 8 nc-work opencode p1-check -- serve`), no process in the container held the key; as a counter-check, the same server without cleanup kept running after the abort.
+Checked in a fresh task: skill `nc-harness-check` loaded in Claude and OpenCode, key neither in `docker inspect` nor in PID 1. After a normal run and after a hard abort (`timeout -s TERM 8 nc-work opencode example-check -- serve`), no process in the container held the key; as a counter-check, the same server without cleanup kept running after the abort.
 
 ## Key proxy
 
@@ -410,7 +410,7 @@ Limits:
 cd work-environments && python3 -m unittest tests/test_policy.py
 ```
 
-The unit tests check, among other things: name and target validation, network rules, the profiles (shipped examples and `tests/fixtures/profiles`) and the overlay (profile precedence, snapshot contents and refusals), safe token hand-over, the choice of the key by the policy (no fallback to the default key), default and title model, agents folders, mounts and generation before the start, the memory view (only the own project) and `nc memory apply`, the key proxy (start, cleanup, rules against a fake target, `check-leak`), mailbox, inbox and the broker (one round, fake harness, fake clock), `create --from-task` with its refusals (exit 4), and that no tracked file in `work-environments/` contains German. Contract tests with the real `bin/nc delegate` and `bin/nc memory apply --broker` are skipped without a harness checkout or `bun`. Some tests read `/proc` and need Linux. The tests never read the real `~/.nc/overlay`.
+The unit tests check, among other things: name and target validation, network rules, the profiles (shipped examples and `tests/fixtures/profiles`) and the overlay (profile precedence, snapshot contents and refusals), safe token hand-over, the choice of the key by the policy (no fallback to the default key), default and title model, agents folders, mounts and generation before the start, the memory view (only the own project) and `nc memory apply`, the key proxy (start, cleanup, rules against a fake target, `check-leak`), mailbox, inbox and the broker (one round, fake harness, fake clock), `create --from-task` with its refusals (exit 4), and that no tracked file in `work-environments/` contains non-English words from a small deny list. Contract tests with the real `bin/nc delegate` and `bin/nc memory apply --broker` are skipped without a harness checkout or `bun`. Some tests read `/proc` and need Linux. The tests never read the real `~/.nc/overlay`.
 
 These are infrastructure checks, not builds or functional tests of the projects. Runtime data lives in `~/.local/share/nc-work/`.
 
