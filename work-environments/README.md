@@ -18,34 +18,59 @@
 
 ## Architecture
 
+The task container and its network:
+
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph host["Host, work user"]
-        ncwork["nc-work"]
-        harness["nc-harness checkout"]
-        secrets["Claude token and secrets.env"]
-        snap["harness snapshot"]
-        broker["nc-work broker"]
-        mailbox["mailbox: requests and inbox"]
+        snap["harness<br/>snapshot"]
+        secrets["Claude token and<br/>secrets.env"]
     end
 
     subgraph net["internal network ncw-TASK"]
-        agent["task container ncw-TASK"]
-        keyp["key proxy ncw-TASK-key-RUN"]
+        agent["task container<br/>ncw-TASK"]
+        keyp["key proxy<br/>ncw-TASK-key-RUN"]
     end
 
-    vols["volumes ncw-TASK-work and ncw-TASK-home"] --- agent
-    snap -->|"read-only at /opt/nc-harness"| agent
-    agent -->|"HTTP_PROXY=http://egress:3128"| egress["egress proxy ncw-TASK-egress"]
-    agent -->|"placeholder key nc-keyproxy"| keyp
-    secrets -->|"one key on stdin"| keyp
-    keyp -->|"CONNECT openrouter.ai:443"| egress
-    egress -->|"allow list"| internet["Internet"]
-    agent -->|"writes requests"| mailbox
-    broker -->|"reads requests, writes answers"| mailbox
-    broker -->|"nc delegate, nc memory apply"| harness
-    ncwork -->|"publish: bundle, verify, push"| github["GitHub"]
+    vols["volumes<br/>ncw-TASK-work and<br/>ncw-TASK-home"] --- agent
+    snap -->|1| agent
+    agent -->|2| egress["egress proxy<br/>ncw-TASK-egress"]
+    agent -->|3| keyp
+    secrets -->|4| keyp
+    keyp -->|5| egress
+    egress -->|6| internet["Internet"]
 ```
+
+1. The harness snapshot is mounted read-only at `/opt/nc-harness`.
+2. The task container reaches the egress proxy through `HTTP_PROXY=http://egress:3128`.
+3. The task container calls the key proxy with the placeholder key `nc-keyproxy`.
+4. The key proxy gets one key on stdin.
+5. The key proxy opens `CONNECT openrouter.ai:443` through the egress proxy.
+6. The egress proxy lets through only the allow list.
+
+The broker and publishing, on the host:
+
+```mermaid
+flowchart LR
+    agent["task container<br/>ncw-TASK"]
+
+    subgraph host["Host, work user"]
+        mailbox["mailbox: requests<br/>and inbox"]
+        broker["nc-work broker"]
+        harness["nc-harness<br/>checkout"]
+        ncwork["nc-work"]
+    end
+
+    agent -->|7| mailbox
+    broker -->|8| mailbox
+    broker -->|9| harness
+    ncwork -->|10| github["GitHub"]
+```
+
+7. The task container writes requests into the mailbox.
+8. The broker reads requests from the mailbox and writes answers back.
+9. The broker calls `nc delegate` and `nc memory apply` in the nc-harness checkout.
+10. `nc-work publish` bundles, verifies and pushes to GitHub.
 
 - **Task container** `ncw-<task>`: runs as uid 1000 with a read-only root file system, no Linux capabilities, `no-new-privileges`, at most 2 CPUs, 4 GiB RAM and 512 processes (fixed in `bin/nc-work`). The project lives in the volume `ncw-<task>-work` at `/workspace`, the agent's home in `ncw-<task>-home`. It sits on the internal network `ncw-<task>`, which has no route out.
 - **Egress proxy** `ncw-<task>-egress`: Squid in the same image, on both the task network (alias `egress`) and the bridge `ncw-egress`. It allows only the DNS names in the profile's `allowed_domains`, on ports 80 and 443, and denies private ranges, Tailscale (`100.64.0.0/10`), localhost and the server's own public addresses (read with `ip -j addr` when the task is created). The same container relays the profile's preview ports from `127.0.0.1` on the host to the agent.
@@ -66,22 +91,23 @@ New tasks use the current harness snapshot (`nc-work snapshot` publishes one). A
 ```mermaid
 sequenceDiagram
     participant U as You
-    participant W as nc-work on the host
-    participant H as nc-harness on the host
+    participant W as Host: nc-work<br/>and nc-harness
     participant C as task container
     participant G as GitHub
     U->>W: nc-work claude TASK
-    W->>H: nc generate (subagent files), nc models orchestrator
-    W->>C: docker exec claude, token only in its environment
-    C->>C: the agent commits on nc-work/TASK
-    U->>W: nc-work publish TASK --push
-    W->>C: git bundle of the task branch
-    W->>W: verify and fetch into a fresh bare repository
-    W->>G: push nc-work/TASK with the work user's SSH login
+    W->>W: nc generate,<br/>nc models orchestrator
+    W->>C: docker exec claude,<br/>token only in its env
+    C->>C: agent commits<br/>on nc-work/TASK
+    U->>W: nc-work publish<br/>TASK --push
+    W->>C: git bundle of<br/>the task branch
+    W->>W: verify, fetch into<br/>fresh bare repo
+    W->>G: push nc-work/TASK<br/>with work user's SSH login
     U->>W: nc-work remove TASK
-    W->>G: git ls-remote, is every commit on GitHub
-    W->>W: delete container, proxy, network, volumes, state
+    W->>G: git ls-remote: is every<br/>commit on GitHub?
+    W->>W: delete container, proxy,<br/>network, volumes, state
 ```
+
+The host column stands for `nc-work` and the host's nc-harness checkout: `nc generate` (subagent files) and `nc models orchestrator` run in nc-harness, every other host step is `nc-work`.
 
 **Claude**: `nc-work claude TASK` reads the Claude token from `~/.local/share/nc-work/auth/`, generates the subagent files from the host's nc-harness checkout (`nc generate`, model and effort per role from `models.yaml`), and starts Claude with the orchestrator's model and effort from `nc models orchestrator`. The token is passed through the environment of `docker exec`, never as an argument and never in the container configuration.
 
