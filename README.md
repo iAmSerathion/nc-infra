@@ -30,31 +30,55 @@ nc-infra works together with [nc-harness](https://github.com/iAmSerathion/nc-har
 
 ### The server
 
+Users, access and tasks:
+
 ```mermaid
 flowchart TB
-    laptop["Your laptop"] -->|"SSH, only through Tailscale"| admin
-    laptop -->|"SSH, only through Tailscale"| work
-    visitors["Website visitors"] -->|"80/443"| caddy
+    laptop["Your laptop"]
 
-    subgraph vps["Ubuntu VPS, ufw: deny incoming except tailscale0, 41641/udp (and 80/443)"]
-        admin["admin user: sudo, separate SSH key, used by a human"]
-        work["work user: no sudo"]
-        work --> docker["rootless Docker of the work user"]
-        docker --> tasks["nc-work tasks, at most three running"]
-        docker --> beszel["Beszel hub, 127.0.0.1:8090, optional"]
+    subgraph vps["Ubuntu VPS, ufw firewall"]
+        admin["admin user<br/>sudo, own SSH key"]
+        work["work user<br/>no sudo"]
+        docker["rootless Docker<br/>of the work user"]
+        tasks["nc-work tasks<br/>at most three running"]
+        beszel["Beszel hub, optional<br/>127.0.0.1:8090"]
+    end
+
+    github["GitHub"]
+
+    laptop -->|"SSH, only<br/>through Tailscale"| admin
+    laptop -->|"SSH, only<br/>through Tailscale"| work
+    work --> docker
+    docker --> tasks
+    docker --> beszel
+    work -->|"nc-work publish --push,<br/>the work user's SSH login"| github
+```
+
+The optional website hosting on the same server:
+
+```mermaid
+flowchart TB
+    visitors["Website visitors"]
+
+    subgraph vps["Ubuntu VPS"]
         subgraph hosting["optional: static websites"]
-            caddy["Caddy, system service"] --> sites["web roots of the host and staging users"]
-            deploy["pull deploy timer, User=host"] --> sites
+            caddy["Caddy<br/>system service"]
+            deploy["pull deploy timer<br/>User=host"]
+            sites["web roots of the<br/>host and staging users"]
         end
     end
 
-    deploy -->|"fetch origin/main, read-only deploy key"| github["GitHub"]
-    work -->|"nc-work publish --push, the work user's SSH login"| github
+    github["GitHub"]
+
+    visitors -->|"80/443"| caddy
+    caddy --> sites
+    deploy --> sites
+    deploy -->|"fetch origin/main,<br/>read-only deploy key"| github
 ```
 
 Agents run as the work user and can never become root.
 
-- **Access**: the admin user has `sudo` and its own SSH key that no agent can reach. The work user has no `sudo` and runs rootless Docker, `nc-work` and the nc-harness checkout. SSH is reachable only through Tailscale.
+- **Access**: the admin user is used by a human; it has `sudo` and its own SSH key that no agent can reach. The work user has no `sudo` and runs rootless Docker, `nc-work` and the nc-harness checkout. SSH is reachable only through Tailscale.
 - **Firewall**: `ufw` denies incoming traffic except on `tailscale0` and `41641/udp` (direct Tailscale connections); `80/tcp` and `443/tcp` only when the server hosts websites.
 - **Hosting (optional)**: `host` and `staging` are service users that own the live and staging web roots. Caddy serves them. A site goes live by pull deploy: a timer fetches the default branch from GitHub, so agents never get a key to the server.
 - **Ports**: container ports are published on `127.0.0.1` only and reached through an SSH tunnel from your laptop.
@@ -64,21 +88,36 @@ Details and commands: [`docs/vps-setup.md`](docs/vps-setup.md) (hosting in [sect
 ### One task
 
 ```mermaid
-flowchart LR
-    subgraph task["internal network ncw-TASK (no route out)"]
-        agent["task container: Claude Code or OpenCode, /workspace and home volumes"]
-        key["key proxy, only during an OpenCode run"]
+flowchart TB
+    snap["harness snapshot<br/>read-only"]
+    host["host: nc-work,<br/>nc-harness, credentials"]
+
+    subgraph task["ncw-TASK, no route out"]
+        agent["task container<br/>Claude Code or OpenCode<br/>/workspace and home volumes"]
+        key["key proxy<br/>only during an<br/>OpenCode run"]
     end
-    snap["harness snapshot, read-only"] --> agent
-    agent -->|"HTTP(S) via egress:3128"| egress["egress proxy, allow list"]
-    agent -->|"placeholder key"| key
-    key -->|"real OpenRouter key"| egress
-    egress -->|"allow-listed DNS names only"| internet["Internet"]
-    host["host: nc-work, nc-harness, credentials"] -->|"key on stdin"| key
-    host -->|"exports the task branch, pushes over SSH"| github["GitHub"]
+
+    egress["egress proxy<br/>allow list"]
+    internet["Internet"]
+    github["GitHub"]
+
+    snap --> agent
+    agent -->|"1"| egress
+    agent -->|"2"| key
+    host -->|"3"| key
+    key -->|"4"| egress
+    egress -->|"5"| internet
+    host -->|"6"| github
 ```
 
-The task container sits on its own internal Docker network; its only way out is the egress proxy. The project comes in from the last commit of its checkout, and the agent works on the branch `nc-work/<task>`. Pushing to GitHub happens on the host, never in the container. Each flow (create, session, publish, broker) is walked through in [`work-environments/README.md`](work-environments/README.md#how-it-works).
+1. The agent sends HTTP(S) through the egress proxy at `egress:3128`.
+2. The agent calls the key proxy with a placeholder key.
+3. The host passes the key to the key proxy on stdin.
+4. The key proxy sends the request on with the real OpenRouter key, through the egress proxy.
+5. The egress proxy lets through allow-listed DNS names only.
+6. The host exports the task branch and pushes it to GitHub over SSH.
+
+The task container sits on its own internal Docker network (`ncw-TASK` in the diagram); its only way out is the egress proxy. The project comes in from the last commit of its checkout, and the agent works on the branch `nc-work/<task>`. Pushing to GitHub happens on the host, never in the container. Each flow (create, session, publish, broker) is walked through in [`work-environments/README.md`](work-environments/README.md#how-it-works).
 
 ## Trust model
 
