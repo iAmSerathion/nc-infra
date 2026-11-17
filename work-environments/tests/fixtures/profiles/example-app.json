@@ -1,0 +1,63 @@
+{
+  "id": "example-app",
+  "path": "clients/acme/app",
+  "github": "example-org/acme-app",
+  "node": "20",
+  "package_manager": "pnpm-9.15.9",
+  "preview_ports": [
+    3000,
+    3001,
+    3002,
+    8081
+  ],
+  "commands": {
+    "build": "pnpm build",
+    "generate": "pnpm --filter ./packages/db exec prisma generate",
+    "shared": "pnpm --dir packages/shared exec tsc -p tsconfig.json"
+  },
+  "allowed_domains": [
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "github.com",
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "api.anthropic.com",
+    "claude.ai",
+    "claude.com",
+    "platform.claude.com",
+    "cdn.playwright.dev",
+    "playwright.download.prss.microsoft.com",
+    "binaries.prisma.sh",
+    "openrouter.ai"
+  ],
+  "external_services": [],
+  "external_services_status": "not-assigned",
+  "database_policy": "task-local test data or explicitly approved external development endpoint; never auto-load source .env",
+  "git_allowed_branch_prefix": "nc-work/",
+  "protected_branches": [
+    "main",
+    "master",
+    "staging",
+    "release/*"
+  ],
+  "limits": {
+    "cpus": 2,
+    "memory_gib": 4,
+    "pids": 512
+  },
+  "notes": "Fresh task DB/cache required; existing shared development containers are not attached. Shared build step is still manual.",
+  "local_services": {
+    "postgres": {
+      "image": "postgres:15-alpine",
+      "port": 5432,
+      "publish": false
+    },
+    "redis": {
+      "image": "redis:7-alpine",
+      "port": 6379,
+      "publish": false
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "id": "example-site",
+  "path": "sites/example-site",
+  "github": "example-org/example-site",
+  "node": "24",
+  "package_manager": "bun",
+  "preview_ports": [
+    3000,
+    5173
+  ],
+  "commands": {
+    "dev": "bun run dev --host 0.0.0.0 --port 3000",
+    "build": "bun run build",
+    "test": "bun run test"
+  },
+  "allowed_domains": [
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "github.com",
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "api.anthropic.com",
+    "claude.ai",
+    "claude.com",
+    "platform.claude.com",
+    "cdn.playwright.dev",
+    "playwright.download.prss.microsoft.com",
+    "openrouter.ai"
+  ],
+  "external_services": [],
+  "external_services_status": "not-assigned",
+  "database_policy": "task-local test data or explicitly approved external development endpoint; never auto-load source .env",
+  "git_allowed_branch_prefix": "nc-work/",
+  "protected_branches": [
+    "main",
+    "master",
+    "staging",
+    "release/*"
+  ],
+  "limits": {
+    "cpus": 2,
+    "memory_gib": 4,
+    "pids": 512
+  },
+  "notes": "Database and schema changes stay with the hosted builder.",
+  "local_services": {}
+}

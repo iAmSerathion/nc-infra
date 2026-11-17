@@ -1,0 +1,42 @@
+{
+  "id": "herdr-nc",
+  "path": "tools/herdr-nc",
+  "github": "iAmSerathion/herdr-nc",
+  "node": "24",
+  "package_manager": "none",
+  "preview_ports": [],
+  "commands": {
+    "check": "scripts/check"
+  },
+  "allowed_domains": [
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "github.com",
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "api.anthropic.com",
+    "claude.ai",
+    "claude.com",
+    "platform.claude.com",
+    "openrouter.ai"
+  ],
+  "external_services": [],
+  "external_services_status": "not-assigned",
+  "database_policy": "task-local test data or explicitly approved external development endpoint; never auto-load source .env",
+  "git_allowed_branch_prefix": "nc-work/",
+  "protected_branches": [
+    "main",
+    "master",
+    "staging",
+    "release/*"
+  ],
+  "limits": {
+    "cpus": 2,
+    "memory_gib": 4,
+    "pids": 512
+  },
+  "notes": "UI checks need the desktop app; do not deploy from this container.",
+  "local_services": {}
+}

@@ -1,0 +1,21 @@
+#!/bin/bash
+set -eu
+mkdir -p /home/agent/.claude /home/agent/.config/opencode /home/agent/.local/bin
+ln -sfn /opt/nc-harness/AGENTS.md /home/agent/.claude/CLAUDE.md
+ln -sfn /opt/nc-harness/AGENTS.md /home/agent/.config/opencode/AGENTS.md
+# Not agents: nc-work mounts the generated roles read-only at ~/.claude/agents (the harness never has a top-level
+# agents folder). An image built from an older version of this file still has `skills agents` here.
+for directory in skills; do
+  if [ -d "/opt/nc-harness/$directory" ]; then
+    ln -sfn "/opt/nc-harness/$directory" "/home/agent/.claude/$directory"
+  fi
+done
+# OpenCode reads skills from ~/.claude/skills as well; its config comes from the harness snapshot.
+# service.json turns OpenCode's shared background server off (it would keep the key after a run).
+for file in opencode.json service.json; do
+  if [ -f "/opt/nc-harness/adapters/opencode/$file" ]; then
+    ln -sfn "/opt/nc-harness/adapters/opencode/$file" "/home/agent/.config/opencode/$file"
+  fi
+done
+if [ -f /opt/nc-harness/bin/nc ]; then ln -sfn /opt/nc-harness/bin/nc /home/agent/.local/bin/nc; fi
+exec "$@"

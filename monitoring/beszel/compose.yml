@@ -1,0 +1,16 @@
+# Beszel hub for one server, in the rootless Docker of the service user. See README.md next to this file.
+name: beszel
+
+services:
+  beszel:
+    image: henrygd/beszel:0.21.2
+    container_name: beszel
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - ${HOME}/.local/share/beszel/hub:/beszel_data
+      # Mount the directory, not the socket: the agent recreates beszel.sock on every start.
+      - ${HOME}/.local/share/beszel/socket:/beszel_socket
+    # No user: override. Container root maps to the rootless Docker user, the owner of the agent socket.
+    # USER_EMAIL/USER_PASSWORD stay unset: the operator creates the account in the UI.

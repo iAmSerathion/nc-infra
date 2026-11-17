@@ -1,0 +1,44 @@
+{
+  "id": "example-client",
+  "path": "clients/acme/website",
+  "github": "example-org/acme-website",
+  "node": "24",
+  "package_manager": "none",
+  "preview_ports": [
+    8080
+  ],
+  "commands": {
+    "dev": "python3 -m http.server 8080 --bind 0.0.0.0"
+  },
+  "allowed_domains": [
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "github.com",
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "api.anthropic.com",
+    "claude.ai",
+    "claude.com",
+    "platform.claude.com",
+    "openrouter.ai"
+  ],
+  "external_services": [],
+  "external_services_status": "not-assigned",
+  "database_policy": "task-local test data or explicitly approved external development endpoint; never auto-load source .env",
+  "git_allowed_branch_prefix": "nc-work/",
+  "protected_branches": [
+    "main",
+    "master",
+    "staging",
+    "release/*"
+  ],
+  "limits": {
+    "cpus": 2,
+    "memory_gib": 4,
+    "pids": 512
+  },
+  "notes": "Independent static website; existing production hosting unchanged.",
+  "local_services": {}
+}

@@ -1,0 +1,33 @@
+#!/usr/bin/python3
+"""Trusted egress + fixed-target preview relay; no credentials, mounts or Docker access."""
+import asyncio, os
+
+async def connection(reader, writer, port):
+    upstream = None
+    try:
+        remote_reader, upstream = await asyncio.wait_for(asyncio.open_connection('agent', port), 10)
+        async def pump(src, dst):
+            while data := await src.read(65536):
+                dst.write(data)
+                await dst.drain()
+            try: dst.write_eof()
+            except (OSError, AttributeError): pass
+        await asyncio.wait_for(asyncio.gather(pump(reader, upstream), pump(remote_reader, writer)), 3600)
+    except (OSError, asyncio.TimeoutError):
+        pass
+    finally:
+        writer.close()
+        if upstream: upstream.close()
+
+async def main():
+    process = await asyncio.create_subprocess_exec('/usr/sbin/squid', '-N', '-f', '/etc/squid/squid.conf')
+    ports = [int(p) for p in os.environ.get('NC_PREVIEW_PORTS', '').split(',') if p]
+    if any(not 1024 <= p <= 65535 for p in ports): raise ValueError('Bad preview port')
+    servers = []
+    for port in ports:
+        servers.append(await asyncio.start_server(lambda r,w,p=port: connection(r,w,p), '0.0.0.0', port))
+    status = await process.wait()
+    for server in servers: server.close()
+    raise SystemExit(status or 1)
+
+asyncio.run(main())

@@ -1,0 +1,23 @@
+# Beszel agent as a systemd user unit of the service user, binary v0.21.2 in ~/.local/bin.
+# Not in Docker: rootless Docker's own network namespace hides the real NIC traffic,
+# and the binary can put its socket straight into the dir the hub container mounts.
+[Unit]
+Description=Beszel agent
+After=docker.service
+
+[Service]
+# A unix socket instead of TCP: without LISTEN the agent binds :45876 on all addresses.
+Environment=LISTEN=%h/.local/share/beszel/socket/beszel.sock
+# Must exist before start, or the agent silently falls back to ~/.config/beszel.
+Environment=DATA_DIR=%h/.local/share/beszel/agent
+# The agent only probes /var/run/docker.sock by itself, never the rootless socket.
+Environment=DOCKER_HOST=unix://%t/docker.sock
+# KEY=<hub public key>, mode 600, not in git. No HUB_URL/TOKEN: the hub dials the socket over SSH.
+EnvironmentFile=%h/.config/beszel/agent.env
+ExecStartPre=/usr/bin/mkdir -p %h/.local/share/beszel/socket %h/.local/share/beszel/agent
+ExecStart=%h/.local/bin/beszel-agent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

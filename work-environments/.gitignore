@@ -1,0 +1,5 @@
+images/toolchains/
+images/claude
+__pycache__/
+*.pyc
+images/opencode

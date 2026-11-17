@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""check-leak FILE… | check-leak -   Host only; never copy this into a container.
+
+Counts how often the real OpenRouter keys (OPENROUTER_API_KEY and OPENROUTER_API_KEY_CLIENTS from nc-harness'
+secrets.env, each read with the same function as nc-work, openrouter_key) occur in the given files or on stdin, raw
+and JSON-escaped. Prints one line per name, counts only, never a value. Exit 0 if no key occurs, 1 if one does, 2 if nothing could be checked.
+Data from a container comes through a pipe: nc-work exec TASK … | check-leak -
+"""
+import importlib.machinery, importlib.util, json, pathlib, sys
+
+def launcher():
+    path = pathlib.Path(__file__).resolve().parent.parent / 'bin/nc-work'
+    loader = importlib.machinery.SourceFileLoader('nc_work_launcher', str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader('nc_work_launcher', loader))
+    loader.exec_module(module)
+    return module
+
+def main(args):
+    if not args or args[0] in ('-h', '--help'):
+        print(__doc__.strip()); return 0 if args else 2
+    nc_work = launcher()
+    keys = {}
+    for name in (nc_work.KEY_DEFAULT, nc_work.KEY_CLIENTS):
+        try: keys[name] = nc_work.openrouter_key(name)
+        except ValueError: keys[name] = None  # the message could be shown, but a name is all that is needed here
+    if not any(keys.values()):
+        print('check-leak: no key readable in secrets.env – nothing checked', file=sys.stderr); return 2
+    data = []
+    for arg in args:
+        try: data.append(sys.stdin.buffer.read() if arg == '-' else pathlib.Path(arg).read_bytes())
+        except OSError as exc:
+            print(f'check-leak: {arg}: not readable ({exc.strerror})', file=sys.stderr); return 2
+    found = False
+    for name, key in keys.items():
+        if key is None:
+            print(f'{name}: not set (not checked)'); continue
+        forms = {key.encode(), json.dumps(key)[1:-1].encode()}
+        count = sum(chunk.count(form) for chunk in data for form in forms)
+        found |= count > 0
+        print(f'{name}: {count}')
+    return 1 if found else 0
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

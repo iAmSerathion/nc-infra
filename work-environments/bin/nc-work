@@ -1,0 +1,2317 @@
+#!/usr/bin/env python3
+"""Trusted host-side launcher. Never install/mount this launcher in an agent container."""
+import argparse, datetime, fcntl, getpass, hashlib, io, json, os, pathlib, re, secrets, select, shutil, signal, subprocess, sys, tarfile, tempfile, time, unicodedata
+from stat import S_ISREG
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+STATE = pathlib.Path.home() / '.local/share/nc-work'
+HARNESS = pathlib.Path.home() / 'projects/personal/nc-harness'
+# Owned by nc-harness. Read only by `nc-work opencode` (and `here --runtime opencode`), one of two values per start, which
+# goes only into that run's key proxy (keyproxy/keyproxy.py, on stdin), never into an agent container:
+# OPENROUTER_API_KEY_CLIENTS (OpenRouter workspace "clients", guardrail with the allowed models) for a project whose
+# policy in models.yaml denies the class free, OPENROUTER_API_KEY for every other project. Never a fallback between the two.
+SECRETS = pathlib.Path.home() / '.config/nc-harness/secrets.env'
+KEY_DEFAULT, KEY_CLIENTS = 'OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_CLIENTS'
+CLIENTS_ONLY = 'in this project OpenCode starts only with the key from the OpenRouter workspace "clients"'
+# nc-harness' checkout of the shared memory; NC_HOME moves it, the same rule as memoryDir() in nc-harness' cli/memory.ts.
+MEMORY = pathlib.Path(os.environ.get('NC_HOME') or pathlib.Path.home() / '.nc') / 'memory'
+# The owner's private files, one fixed folder (often a link to a private checkout); no environment variable moves it.
+OVERLAY = pathlib.Path.home() / '.nc/overlay'
+PROFILE_DIRS = (OVERLAY / 'profiles', ROOT / 'profiles')  # the first folder wins on the same id
+OVERLAY_SNAPSHOT = ('AGENTS.md', 'models.yaml')  # the only overlay files a container gets
+OVERLAY_MAX = 256 * 1024
+MEMORY_VIEW, MEMORY_OUTBOX = '/opt/nc-memory', '/opt/nc-memory-outbox'  # paths inside the task container
+AGENTS_CLAUDE, AGENTS_OPENCODE = '/home/agent/.claude/agents', '/etc/opencode/agents'  # paths inside the task container
+BROKER_REQUESTS, BROKER_INBOX = '/opt/nc-requests', '/opt/nc-inbox'  # paths inside the task container (nc delegate)
+# TMPDIR for OpenCode inside the task container: /tmp there is a tmpfs with noexec, and OpenCode's interface loads a
+# native library (OpenTUI) that Bun unpacks into TMPDIR. /workspace and the home are executable anyway.
+OPENCODE_TMP = '/home/agent/.cache/nc-tmp'
+IMAGE = 'nc-work:2026-11-13'
+LABEL = 'dev.nc-work'
+VERSIONS = {'20': '20.20.2', '24': '24.22.3', '26': '26.13.1'}
+
+class TooManyTasks(ValueError):
+    """Three agent containers run already; main() exits 3 so callers (nc delegate) can tell it apart."""
+
+class Refused(ValueError):
+    """create --from-task refuses on a rule, not on a fault; main() exits 4 so nc delegate can pass the reason on."""
+
+# A folder below ~/projects, the same rule as nc-harness' PROJECT_PATH (cli/models.ts): no empty, `.` or `..` parts.
+PROJECT_PATH = re.compile(r'[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*/?')
+
+def valid_project_path(value):
+    return isinstance(value, str) and bool(PROJECT_PATH.fullmatch(value)) and not any(part in ('.', '..') for part in value.split('/'))
+
+def run(*args, capture=False, **kw):
+    return subprocess.run([str(a) for a in args], check=True,
+                          stdout=kw.pop('stdout', subprocess.PIPE if capture else None), **kw)
+
+def output(*args):
+    return run(*args, capture=True).stdout.decode().strip()
+
+def valid(value):
+    if not re.fullmatch(r'[a-z][a-z0-9-]{0,39}', value):
+        raise ValueError('Use lowercase letters, digits and hyphens; start with a letter; max 40 chars')
+    return value
+
+def save(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, indent=2) + '\n')
+    tmp.replace(path)
+
+def profile(name):
+    valid(name)
+    for folder in PROFILE_DIRS:
+        f = folder / (name + '.json')
+        if f.is_file(): break
+    p = json.loads(f.read_text())
+    assert p['id'] == name and p['node'] in VERSIONS
+    return p
+
+def task(name):
+    valid(name)
+    return json.loads((STATE / 'tasks' / (name + '.json')).read_text())
+
+def dex(name, *cmd, capture=False, interactive=False):
+    # Programs by absolute path: ~/.local/bin comes first on the container's PATH and the agent writes there.
+    flags = ['-it'] if interactive and sys.stdin.isatty() else []
+    return run('docker', 'exec', *flags, '-w', '/workspace', 'ncw-' + name, *cmd, capture=capture)
+
+def overlay_files():
+    """The overlay's AGENTS.md and models.yaml for the snapshot, {name: bytes}. Only a regular file that is not a link
+    (a committed link could pull any host file into every container), at most OVERLAY_MAX bytes; anything else refuses
+    instead of silently leaving the public defaults in place. Uncommitted changes refuse too, as for the harness."""
+    if not os.path.lexists(OVERLAY): return {}
+    if not OVERLAY.is_dir(): raise ValueError(f'{OVERLAY} is not a folder (or a dangling link)')
+    git = subprocess.run(['git', '-C', str(OVERLAY), 'status', '--porcelain', '--', *OVERLAY_SNAPSHOT], capture_output=True)
+    if git.returncode == 0 and git.stdout.strip():  # a non-zero exit: no git checkout behind the overlay
+        raise ValueError(f'{OVERLAY} has uncommitted changes in {" or ".join(OVERLAY_SNAPSHOT)}; commit them before snapshotting')
+    files = {}
+    for name in OVERLAY_SNAPSHOT:
+        try: fd = os.open(OVERLAY / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # NONBLOCK: a FIFO must not hang
+        except FileNotFoundError: continue
+        except OSError as exc: raise ValueError(f'overlay {name} refused: not a readable regular file ({exc.strerror})')
+        if not S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd); raise ValueError(f'overlay {name} refused: not a regular file')
+        with os.fdopen(fd, 'rb') as f: data = f.read(OVERLAY_MAX + 1)
+        if len(data) > OVERLAY_MAX: raise ValueError(f'overlay {name} refused: larger than {OVERLAY_MAX} bytes')
+        files[name] = data
+    if 'models.yaml' not in files:  # same rule as the host: an overlay brings its own policy or none of it counts
+        raise ValueError(f'{OVERLAY} has no models.yaml; an overlay needs its own policy')
+    return files
+
+def snapshot():
+    if output('git', '-C', HARNESS, 'status', '--porcelain'):
+        raise ValueError('Harness has uncommitted changes; commit/review separately before snapshotting')
+    commit = output('git', '-C', HARNESS, 'rev-parse', 'HEAD')
+    extra = overlay_files()
+    tag = commit
+    if extra:  # a new overlay content gives a new snapshot; running tasks keep theirs
+        digest = hashlib.sha256()
+        for name in sorted(extra): digest.update(f'{name}\0{len(extra[name])}\0'.encode() + extra[name])
+        tag += '-' + digest.hexdigest()[:12]
+    target = STATE / 'harness' / tag
+    if not target.exists():
+        tmp = target.with_name(tag + '.tmp')  # built aside and renamed: a crash never leaves a half snapshot under the tag
+        if os.path.lexists(tmp): shutil.rmtree(tmp)
+        archive = run('git', '-C', HARNESS, 'archive', commit, capture=True).stdout
+        tmp.mkdir(parents=True)
+        base = tmp.resolve()  # resolved too: a home behind a link must not make every path look unsafe
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            for item in tar.getmembers():
+                dest = (base / item.name).resolve()
+                if not dest.is_relative_to(base) or item.issym() or item.islnk():
+                    raise ValueError('Unsafe link/path in harness archive')
+            tar.extractall(tmp)
+        for name, data in extra.items(): (tmp / name).write_bytes(data)
+        os.replace(tmp, target)
+    save(STATE / 'harness-current.json', {'commit': tag})
+    return tag
+
+def runtime_path(p):
+    return f'/opt/toolchains/node/{VERSIONS[p["node"]]}/bin:/opt/toolchains/bun/1.4.4/bin:/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin'
+
+def own_addresses(ip_json=None):
+    """This server's own global addresses for the egress proxy's this_server deny, read from `ip -j addr show scope
+    global` when a task's proxy config is written, not fixed in the code: a rebuilt server with a new address stays
+    blocked. Only publicly routable addresses count (ip.is_global): docker bridges, Tailscale and other private ranges
+    are denied by blocked_dst anyway and must not make the list look complete when the public address is missing.
+    IPv4 as /32 (only this host); IPv6 as its prefix, but never narrower than /64 (a /128 or AnyIP setup still gets
+    the whole /64, as before). Validated through ipaddress, so nothing from `ip` reaches the squid config unchecked.
+    No public address: ValueError – no proxy config without the deny (a task would otherwise reach this server's
+    public services)."""
+    import ipaddress
+    try:
+        data = json.loads(ip_json if ip_json is not None else output('ip', '-j', 'addr', 'show', 'scope', 'global'))
+    except (OSError, subprocess.CalledProcessError, ValueError, TypeError) as e:
+        raise ValueError(f'own addresses not readable with ip -j addr ({e}) – no egress proxy without the this_server deny')
+    nets = []
+    for iface in data if isinstance(data, list) else []:
+        infos = iface.get('addr_info') if isinstance(iface, dict) else None
+        for a in infos if isinstance(infos, list) else []:
+            if not isinstance(a, dict): continue
+            try:
+                ip = ipaddress.ip_address(a.get('local', ''))
+                if not ip.is_global: continue
+                net = (ipaddress.ip_network(f'{ip}/32') if ip.version == 4
+                       else ipaddress.ip_network(f'{ip}/{min(int(a.get("prefixlen", 64)), 64)}', strict=False))
+            except (TypeError, ValueError):
+                continue
+            if net not in nets: nets.append(net)
+    if not nets:
+        raise ValueError('no public address found with ip -j addr – no egress proxy without the this_server deny')
+    return [str(n) for n in nets]
+
+def proxy_config(domains, own=None):
+    for domain in domains:
+        if not re.fullmatch(r'[a-z0-9][a-z0-9.-]+', domain):
+            raise ValueError('Only explicit DNS names allowed')
+    own = own_addresses() if own is None else own
+    return '''http_port 3128
+pid_filename /tmp/squid.pid
+cache_log /dev/stderr
+access_log none
+cache_store_log none
+cache deny all
+shutdown_lifetime 1 seconds
+visible_hostname nc-work-egress
+acl SSL_ports port 443
+acl Safe_ports port 80 443
+acl CONNECT method CONNECT
+acl blocked_dst dst 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 ::1/128 fc00::/7 fe80::/10
+acl this_server dst ''' + ' '.join(own) + '''
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
+http_access deny blocked_dst
+http_access deny this_server
+acl allowed_domains dstdomain ''' + ' '.join(domains) + '''
+http_access allow allowed_domains
+http_access deny all
+forwarded_for delete
+via off
+'''
+
+def memory_paths(name):
+    base = STATE / 'memory' / valid(name)
+    return base / 'view', base / 'outbox'
+
+MEMORY_LOCK_WAIT = 30  # seconds memory_view waits for its shared lock on ~/.nc/memory, then goes on without it
+
+def memory_lock_shared():
+    """A shared flock on the folder ~/.nc/memory itself – the lock nc memory takes exclusively with flock(1) while it pulls and
+    commits – so the view never copies half a pull. Only for a real folder. Returns the fd (the caller closes it: an fd left open
+    would hold the lock as long as the process runs, and every later note would fail on it), or None: no folder, not openable,
+    or not got within MEMORY_LOCK_WAIT seconds (then with a warning). Never a new error for creating or starting a task."""
+    if MEMORY.is_symlink() or not MEMORY.is_dir(): return None
+    try: fd = os.open(MEMORY, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError: return None
+    deadline = time.monotonic() + MEMORY_LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB); return fd
+        except BlockingIOError:
+            if time.monotonic() < deadline: time.sleep(0.1); continue
+            print(f'nc-work: warning: ~/.nc/memory has been locked for {MEMORY_LOCK_WAIT} s (nc memory is writing) – view refreshed without the lock', file=sys.stderr)
+        except OSError: pass
+        os.close(fd); return None
+
+def memory_view(name, project):
+    """Fill the task's memory view from the host's ~/.nc/memory: MEMORY.md, global/ and projects/<project>.md,
+    nothing else (no journal, no other project). Regular .md files only, links are skipped. Rewritten in place,
+    so a running container sees the new state through its read-only bind mount: every file is replaced atomically
+    (.<name>.tmp, then rename), and only then goes what no longer belongs – a search in that moment never finds an
+    empty view. Under a shared lock on ~/.nc/memory (memory_lock_shared), and for the whole run under an exclusive lock on
+    the task's folder STATE/memory/<task>: two runs for the same task (the broker refreshing after stored while a session
+    starts) share the temp names, so one could put the other's half-written file in place or fail on a vanished one."""
+    view, _ = memory_paths(name)
+    view.mkdir(parents=True, exist_ok=True)
+    view.parent.chmod(0o700)
+    task_fd = os.open(view.parent, os.O_RDONLY | os.O_DIRECTORY)
+    fd = None
+    try:
+        fcntl.flock(task_fd, fcntl.LOCK_EX)
+        fd = memory_lock_shared()
+        wanted = set()
+        def copy(src, rel):
+            if src.is_symlink() or not src.is_file() or src.suffix != '.md': return
+            dst = view / rel
+            for parent in reversed(dst.relative_to(view).parents[:-1]):  # a link or a file where a folder belongs goes
+                folder = view / parent
+                if folder.is_symlink() or (folder.exists() and not folder.is_dir()): folder.unlink()
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.is_dir() and not dst.is_symlink(): shutil.rmtree(dst)
+            tmp = dst.parent / ('.' + dst.name + '.tmp')
+            tmp.unlink(missing_ok=True)
+            shutil.copyfile(src, tmp)
+            tmp.chmod(0o644)
+            os.replace(tmp, dst)
+            wanted.add(pathlib.Path(rel))
+        if not (MEMORY / 'MEMORY.md').is_file():
+            print('nc-work: ~/.nc/memory is missing or empty – task without memory content (install.sh of nc-harness)', file=sys.stderr)
+        copy(MEMORY / 'MEMORY.md', 'MEMORY.md')
+        shared = MEMORY / 'global'
+        if shared.is_dir() and not shared.is_symlink():
+            for folder, _, files in os.walk(shared):  # does not descend into linked folders
+                for f in sorted(files):
+                    src = pathlib.Path(folder) / f
+                    copy(src, src.relative_to(MEMORY))
+        projects = view / 'projects'
+        if projects.is_symlink() or (projects.exists() and not projects.is_dir()): projects.unlink()
+        projects.mkdir(exist_ok=True)
+        copy(MEMORY / 'projects' / (valid(project) + '.md'), pathlib.Path('projects') / (project + '.md'))
+        keep = wanted | {d for w in wanted for d in w.parents} | {pathlib.Path('projects')}
+        for folder, dirs, files in os.walk(view, topdown=False):  # what no longer belongs, deepest first
+            for n in files + dirs:
+                path = pathlib.Path(folder) / n
+                if path.relative_to(view) in keep: continue
+                if path.is_dir() and not path.is_symlink(): shutil.rmtree(path)
+                else: path.unlink()
+    finally:
+        if fd is not None: os.close(fd)
+        os.close(task_fd)
+    return view
+
+def memory_outbox(name):
+    """Empty folder for the task's memory requests. The container's uid 1000 is a subuid on the host, so the folder
+    is world-writable; the host user owns it and can delete whatever the container puts there."""
+    _, outbox = memory_paths(name)
+    outbox.mkdir(parents=True, exist_ok=True)
+    outbox.chmod(0o777)
+    return outbox
+
+def memory_mounts(view, outbox):
+    """View read-only, outbox writable; nc memory finds both through the environment."""
+    return ['--mount', f'type=bind,src={view},dst={MEMORY_VIEW},readonly',
+            '--mount', f'type=bind,src={outbox},dst={MEMORY_OUTBOX}',
+            '--env', f'NC_MEMORY_DIR={MEMORY_VIEW}', '--env', f'NC_MEMORY_OUTBOX={MEMORY_OUTBOX}']
+
+def memory_pending(name):
+    """Requests waiting in a task's outbox (rejected ones included: they stay until someone looks at them).
+    The same entries nc memory apply takes: every *.json not starting with a dot."""
+    _, outbox = memory_paths(name)
+    return len([f for f in outbox.glob('*.json') if not f.name.startswith('.')]) if outbox.is_dir() else 0
+
+def memory_apply(m):
+    """Hand a task's outbox to nc-harness. The project is this task's record, never anything from a request.
+    Applied requests are deleted, rejected ones stay with a .reason file. Then the view is refreshed."""
+    if m.get('worker'): raise ValueError(f'{m["id"]}: worker task without memory (nc delegate)')
+    if not m.get('memory'): raise ValueError(f'{m["id"]}: task without memory (created by an older nc-work)')
+    _, outbox = memory_paths(m['id'])
+    print(f'{m["id"]}: ', end='', flush=True)
+    r = subprocess.run([str(HARNESS / 'bin/nc'), 'memory', 'apply', '--outbox', str(outbox), '--project', valid(m['project'])])
+    memory_view(m['id'], m['project'])
+    return r.returncode == 0
+
+def agents_paths(name):
+    base = STATE / 'agents' / valid(name)
+    return base, base / 'claude', base / 'opencode'
+
+def agents_folders(name):
+    """STATE/agents/<name>/claude and /opencode, 0755 whatever the umask: the container's uid 1000 is a subuid on
+    the host and reads as "other". A link or a non-folder is left alone, with a warning line."""
+    base, *subs = agents_paths(name)
+    for folder in [base, *subs]:
+        if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+            print(f'nc-work: warning: {folder} is a link or not a folder – left alone', file=sys.stderr)
+            if folder == base: return False
+            continue
+        folder.mkdir(parents=True, exist_ok=True)
+        if folder != base: folder.chmod(0o755)
+    return True
+
+def agents_mounts(name, project_path):
+    """Both folders read-only: Claude's user level and OpenCode's system folder (/etc/opencode holds last, so a
+    project file of the same name cannot change what the generated file sets). nc doctor finds them through
+    NC_AGENTS, nc models finds the policy through NC_PROJECT_PATH."""
+    _, claude_dir, opencode_dir = agents_paths(name)
+    return ['--mount', f'type=bind,src={claude_dir},dst={AGENTS_CLAUDE},readonly',
+            '--mount', f'type=bind,src={opencode_dir},dst={AGENTS_OPENCODE},readonly',
+            '--env', f'NC_AGENTS={AGENTS_CLAUDE}:{AGENTS_OPENCODE}', '--env', f'NC_PROJECT_PATH={project_path}']
+
+def broker_paths(name):
+    base = STATE / 'broker' / valid(name)
+    return base, base / 'requests', base / 'inbox'
+
+def broker_folders(name):
+    """STATE/broker/<name> (0700) with requests (0777: the container's uid 1000 is a subuid on the host, like the
+    memory outbox) and inbox (0755, mounted read-only). A link or a non-folder is left alone, with a warning line.
+    Only for tasks the broker looks after: the broker itself never makes these folders."""
+    base, *subs = broker_paths(name)
+    for folder in [base, *subs]:
+        if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+            print(f'nc-work: warning: {folder} is a link or not a folder – left alone', file=sys.stderr)
+            if folder == base: return False
+            continue
+        folder.mkdir(parents=True, exist_ok=True)
+        folder.chmod(0o700 if folder == base else 0o777 if folder.name == 'requests' else 0o755)
+    return True
+
+def broker_mounts(name):
+    """Requests writable, inbox read-only; nc delegate finds both through the environment."""
+    _, requests, inbox = broker_paths(name)
+    return ['--mount', f'type=bind,src={requests},dst={BROKER_REQUESTS}',
+            '--mount', f'type=bind,src={inbox},dst={BROKER_INBOX},readonly',
+            '--env', f'NC_REQUESTS={BROKER_REQUESTS}', '--env', f'NC_INBOX={BROKER_INBOX}']
+
+def broker_pending(name):
+    """Requests waiting in a task's mailbox: everything that is not a folder and does not start with a dot."""
+    _, requests, _ = broker_paths(name)
+    if requests.is_symlink() or not requests.is_dir(): return 0
+    with os.scandir(requests) as entries:
+        return len([e for e in entries if not e.name.startswith('.') and not e.is_dir(follow_symlinks=False)])
+
+def first_line(data):
+    return next((line.strip() for line in data.decode(errors='replace').splitlines() if line.strip()), '')
+
+def agents_clear(folder):
+    """Regular files only; the folder stays (running containers have it mounted). Nothing when the folder or the
+    task folder above it is a link: the files there belong to something else (a link to ~/.config would empty
+    ~/.config/opencode)."""
+    if folder.is_symlink() or folder.parent.is_symlink() or not folder.is_dir(): return
+    for f in folder.iterdir():
+        if f.is_file() and not f.is_symlink(): f.unlink(missing_ok=True)
+
+def agents_generate(m, runtime):
+    """Before every session start: the task's agent files from the host's harness checkout (never the snapshot,
+    like memory_apply), with the policy of the project's host folder. Replaced inside the mounted folders, so a
+    running container sees them. Silent on success; otherwise one warning line, and before OpenCode the OpenCode
+    files go, so no agent runs with a model from an older state (not through a linked task folder). The session
+    starts either way. Returns whether it warned."""
+    base, _, opencode_dir = agents_paths(m['id'])
+    cmd = [str(HARNESS / 'bin/nc'), 'generate', '--out', str(base),
+           '--path', str(pathlib.Path.home() / 'projects' / m['project_path'])]
+    reason, lock = None, None
+    try:
+        if base.is_symlink() or (base.exists() and not base.is_dir()): raise OSError(f'{base} is a link or not a folder')
+        base.mkdir(parents=True, exist_ok=True)
+        lock = (base / '.lock').open('a')  # per task, not launcher.lock: create holds that for minutes
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        r = subprocess.run(cmd, cwd='/', timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r.returncode: reason = f'nc generate: Exit {r.returncode}' + (f', {line}' if (line := first_line(r.stderr)) else '')
+    except subprocess.TimeoutExpired: reason = 'timeout'
+    except OSError as exc: reason = str(exc)
+    try:
+        if reason is None: return False
+        if runtime == 'opencode' and not base.is_symlink():
+            try: agents_clear(opencode_dir)
+            except OSError: pass
+        print(f'nc-work: warning: agents not generated ({reason}) – '
+              + ('OpenCode starts without roles' if runtime == 'opencode' else 'the roles of the last start stay'), file=sys.stderr)
+        return True
+    finally:
+        if lock: lock.close()  # releases the lock before docker exec
+
+def orchestrator_args():
+    """(--model/--effort for Claude from claude_code.orchestrator in the host checkout, whether it warned).
+    Exit 1 (not set): none, silently. Anything else: none, with one warning line; Claude starts either way."""
+    try:
+        r = subprocess.run([str(HARNESS / 'bin/nc'), 'models', 'orchestrator'], cwd='/', timeout=60,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.TimeoutExpired: reason = 'timeout'
+    except OSError as exc: reason = str(exc)
+    else:
+        found = re.fullmatch(r'(opus|fable) (low|medium|high|xhigh|max)', r.stdout.decode(errors='replace').strip())
+        if r.returncode == 0 and found: return ['--model', found[1], '--effort', found[2]], False
+        if r.returncode == 1: return [], False
+        line = first_line(r.stderr) or first_line(r.stdout)
+        reason = f'nc models orchestrator: Exit {r.returncode}' + (f', {line}' if line else '')
+    print(f'nc-work: warning: orchestrator setting not read ({reason}) – Claude starts without --model and --effort', file=sys.stderr)
+    return [], True
+
+def pause_after_warning(warned):
+    """Claude clears the screen as it starts, and OpenCode draws over it: in a terminal the warning lines would be
+    gone before anyone read them. So they stay 3 seconds."""
+    if warned and sys.stdin.isatty() and sys.stderr.isatty(): time.sleep(3)
+
+def create(p, name, offline=False, quiet=False, worker=False, from_task=None):
+    """from_task=REQUESTER (only with worker): the worker starts from the last commit of that task, checked and
+    fetched into a temporary folder first (see from_task_source), instead of from the checkout in ~/projects."""
+    if from_task is not None and not worker: raise ValueError('wrong call: --from-task only together with --worker')
+    if from_task is None: return create_task(p, name, offline, quiet, worker)
+    with tempfile.TemporaryDirectory(prefix='ncw-from-task-') as tmp:
+        return create_task(p, name, offline, quiet, worker, from_task, pathlib.Path(tmp))
+
+FROM_TASK_LIMIT = 120  # seconds for each step inside the requester's container (git status, bundle create, stat, copy)
+
+def from_task_source(p, requester, tmp):
+    """Everything create --from-task checks before it saves anything; Refused on a rule, ValueError on a fault.
+    The requester must be a mailbox task of the same project whose container runs and whose workspace is clean.
+    Its HEAD comes out as a bundle, is verified and fetched into a bare repo in tmp as refs/heads/nc-from-task
+    (fsck), and base is read there, never from anything the container says. Between the requester's own base and
+    this commit nothing may have changed in the OpenCode project configuration: a project's opencode.json loads
+    after the global configuration and would bring its own policies, plugin and provider into the worker.
+    Returns (base, bundle, the requester's broker_token, the requester's project path) with the bundle (HEAD and
+    nc-from-task) for the worker's clone. The project path is the one in the requester's record, never the profile's
+    current one: the policy of the worker is the policy of the task it works for."""
+    requester = valid(requester)
+    try: t = json.loads((STATE / 'tasks' / (requester + '.json')).read_text())
+    except (OSError, ValueError): raise Refused(f'requesting task {requester} does not exist')
+    if t.get('id') != requester or t.get('status') != 'ready': raise Refused(f'requesting task {requester} is not ready')
+    if t.get('broker') is not True or not re.fullmatch(r'[0-9a-f]{32}', str(t.get('broker_token'))): raise Refused(f'requesting task {requester} is not a mailbox task (tasks from an older nc-work have no mailbox; create a new one)')
+    if t.get('project') != p['id']: raise Refused(f'requesting task {requester} belongs to another project')
+    if not valid_project_path(t.get('project_path')): raise Refused(f'requesting task {requester} has no valid project path in its record')
+    if container_state(requester) != 'running': raise Refused(f'requesting task {requester} is not running – nc-work start {requester}')
+    r = container_exec(requester, '/usr/bin/git', '--no-optional-locks', '-c', 'core.hooksPath=/dev/null',
+                       '-c', 'core.fsmonitor=false', 'status', '--porcelain', timeout=FROM_TASK_LIMIT)
+    if r.returncode: raise exec_failed(requester, 'git status in the container failed', r)
+    if r.stdout.strip(): raise Refused('the requesting task has uncommitted changes – commit first')
+    bare = tmp / 'from-task.git'
+    fetch_bundle(requester, bare, ['HEAD'], 'HEAD:refs/heads/nc-from-task', too_big=Refused, limit=FROM_TASK_LIMIT)
+    r = bare_git(bare, 'rev-parse', '--verify', 'refs/heads/nc-from-task^{commit}')
+    base = r.stdout.decode().strip()
+    if r.returncode or not re.fullmatch(r'[0-9a-f]{40}', base): raise exec_failed(requester, 'HEAD missing in the bundle', r)
+    old = t.get('base')
+    # The requester's own base must be an ancestor of its HEAD, not just somewhere in the bundle: else the lock below
+    # would compare against a commit the history no longer runs through.
+    if not isinstance(old, str) or not re.fullmatch(r'[0-9a-f]{40}', old) or bare_git(bare, 'merge-base', '--is-ancestor', old, 'refs/heads/nc-from-task').returncode:
+        raise Refused('history rewritten – the base of the requesting task is not an ancestor of its last commit')
+    r = bare_git(bare, 'diff', '--quiet', old, base, '--', 'opencode.json', 'opencode.jsonc', '.opencode')
+    if r.returncode == 1: raise Refused('the requesting task changed the OpenCode project configuration')
+    if r.returncode: raise exec_failed(requester, 'comparing the OpenCode project configuration failed', r)
+    for cmd in (['symbolic-ref', 'HEAD', 'refs/heads/nc-from-task'],
+                ['bundle', 'create', '-q', str(tmp / 'worker.bundle'), 'HEAD', 'refs/heads/nc-from-task']):
+        r = bare_git(bare, *cmd)
+        if r.returncode: raise exec_failed(requester, 'bundle for the worker not created', r)
+    return base, tmp / 'worker.bundle', t['broker_token'], t['project_path']
+
+def create_task(p, name, offline=False, quiet=False, worker=False, from_task=None, tmp=None):
+    """worker=True (for nc delegate): the record says worker and memory false, and the container gets no memory
+    view, no outbox and no memory environment, so a worker never writes to the shared memory."""
+    valid(name)
+    meta_path = STATE / 'tasks' / (name + '.json')
+    if meta_path.exists(): raise ValueError('Task exists; use start/enter')
+    if (STATE / 'memory' / name).exists():  # a new task must not inherit another task's requests
+        raise ValueError(f'memory folder of an earlier task {name} is still there ({STATE / "memory" / name}); run nc-work remove {name} first')
+    agents = STATE / 'agents' / name
+    if agents.exists() or agents.is_symlink():  # a new task must not start with another task's roles
+        raise ValueError(f'agents folder of an earlier task {name} is still there ({agents}); run nc-work remove {name} first')
+    mailbox = STATE / 'broker' / name
+    if not worker and (mailbox.exists() or mailbox.is_symlink()):  # same for the mailbox: no old requests, no old answers
+        raise ValueError(f'mailbox folder of an earlier task {name} is still there ({mailbox}); run nc-work remove {name} first')
+    running = output('docker', 'ps', '-q', '--filter', f'label={LABEL}.kind=agent').splitlines()
+    if len(running) >= 3: raise TooManyTasks('3 tasks are already running; stop one first (nc-work stop <task>)')
+    # before anything is created: without the own addresses there is no proxy config (own_addresses refuses)
+    proxy_conf = None if offline else proxy_config(p['allowed_domains'])
+    project_path = p['path']
+    if from_task is not None:  # the checkout in ~/projects is neither checked nor read
+        base, from_bundle, from_token, project_path = from_task_source(p, from_task, tmp)
+    else:
+        source = pathlib.Path.home() / 'projects' / p['path']
+        if output('git', '-C', source, 'status', '--porcelain'):
+            raise ValueError('Source checkout has local changes; preserve/review before creating a task')
+        base = output('git', '-C', source, 'rev-parse', 'HEAD')
+    current = STATE / 'harness-current.json'
+    commit = json.loads(current.read_text())['commit'] if current.exists() else snapshot()
+    workspace, home = 'ncw-' + name + '-work', 'ncw-' + name + '-home'
+    save(meta_path, {'id': name, 'project': p['id'], 'status': 'provisioning', 'proxy': None, 'volumes': [workspace, home]})
+    for vol in (workspace, home):
+        run('docker', 'volume', 'create', '--label', f'{LABEL}.task={name}', vol, capture=True)
+    run('docker', 'run', '--rm', '--network', 'none', '--user', '0:0', '--entrypoint', '/bin/sh',
+        '--mount', f'type=volume,src={workspace},dst=/workspace', '--mount', f'type=volume,src={home},dst=/home/agent',
+        IMAGE, '-c', 'chown 1000:1000 /workspace /home/agent && mkdir -p /home/agent/.claude/agents '
+        '&& chown 1000:1000 /home/agent/.claude /home/agent/.claude/agents')  # else Docker makes .claude for the bind mount as root
+    network = 'none'
+    proxy = None
+    if not offline:
+        network = 'ncw-' + name
+        run('docker', 'network', 'create', '--internal', '--label', f'{LABEL}.task={name}', network, capture=True)
+        if not output('docker', 'network', 'ls', '-q', '--filter', 'name=^ncw-egress$'):
+            run('docker', 'network', 'create', '--label', f'{LABEL}.kind=egress', 'ncw-egress', capture=True)
+        config = STATE / 'proxy' / (name + '.conf')
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(proxy_conf)
+        proxy = 'ncw-' + name + '-egress'
+        save(meta_path, {'id': name, 'project': p['id'], 'status': 'provisioning', 'proxy': proxy, 'volumes': [workspace, home]})
+        proxy_args = ['docker', 'run', '-d', '--name', proxy, '--label', f'{LABEL}.task={name}',
+            '--init', '--network', 'ncw-egress', '--user', '1000:1000',
+            '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--read-only',
+            '--tmpfs', '/tmp:rw,nosuid,nodev,size=64m,mode=1777', '--memory', '256m', '--pids-limit', '128',
+            '--mount', f'type=bind,src={config},dst=/etc/squid/squid.conf,readonly',
+            '--env', 'NC_PREVIEW_PORTS=' + ','.join(str(p) for p in p['preview_ports']),
+            '--entrypoint', '/usr/local/bin/nc-egress']
+        for port in p['preview_ports']: proxy_args += ['-p', f'127.0.0.1::{port}']
+        run(*proxy_args, IMAGE, capture=True)
+        run('docker', 'network', 'connect', '--alias', 'egress', network, proxy)
+    agents_folders(name)  # filled by the first session start, not here
+    if not worker: broker_folders(name)  # workers never delegate on: no mailbox, no inbox
+    args = ['docker', 'run', '-d', '--name', 'ncw-' + name,
+        '--label', f'{LABEL}.kind=agent', '--label', f'{LABEL}.project={p["id"]}', '--label', f'{LABEL}.task={name}',
+        '--network', network, '--user', '1000:1000', '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges', '--read-only', '--init', '--cpus', '2',
+        '--memory', '4g', '--memory-swap', '4g', '--pids-limit', '512', '--shm-size', '256m',
+        '--tmpfs', '/tmp:rw,nosuid,nodev,size=512m,mode=1777',
+        '--mount', f'type=volume,src={workspace},dst=/workspace',
+        '--mount', f'type=volume,src={home},dst=/home/agent',
+        '--mount', f'type=bind,src={STATE / "harness" / commit},dst=/opt/nc-harness,readonly',
+        *([] if worker else memory_mounts(memory_view(name, p['id']), memory_outbox(name))),
+        *agents_mounts(name, project_path),
+        *([] if worker else broker_mounts(name)),
+        '--env', f'PATH={runtime_path(p)}', '--env', f'NC_HARNESS_VERSION={commit}', '--env', f'NC_PROJECT={p["id"]}']
+    if not offline:
+        args += ['--network-alias', 'agent']
+        for key in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
+            args += ['--env', key + '=http://egress:3128']
+        args += ['--env', 'NO_PROXY=localhost,127.0.0.1', '--env', 'no_proxy=localhost,127.0.0.1']
+    run(*args, IMAGE, capture=True)
+    # Bundle only committed Git data; never copy untracked .env, node_modules or host auth.
+    with tempfile.TemporaryDirectory(prefix='ncw-bundle-') as tmp_dir:
+        if from_task is not None: bundle = from_bundle  # checked and fetched above, the requester's HEAD
+        else:
+            bundle = pathlib.Path(tmp_dir) / 'source.bundle'
+            run('git', '-C', source, 'bundle', 'create', bundle, 'HEAD')
+        with bundle.open('rb') as stream:
+            run('docker', 'exec', '-i', 'ncw-' + name, '/bin/sh', '-c', '/bin/cat > /tmp/source.bundle', stdin=stream)
+        dex(name, '/usr/bin/git', 'clone', '/tmp/source.bundle', '/workspace')
+    dex(name, '/usr/bin/git', 'switch', '-c', 'nc-work/' + name)
+    if from_task is not None and dex(name, '/usr/bin/git', 'rev-parse', 'HEAD', capture=True).stdout.decode().strip() != base:
+        raise ValueError(f'{name}: the worker is not on the checked commit {base}')
+    dex(name, '/usr/bin/git', 'remote', 'remove', 'origin')
+    dex(name, '/usr/bin/git', 'config', 'user.name', 'nc-work')
+    dex(name, '/usr/bin/git', 'config', 'user.email', 'noreply@local.invalid')
+    dex(name, '/usr/bin/rm', '/tmp/source.bundle')
+    meta = {'status': 'ready', 'id': name, 'project': p['id'], 'base': base, 'harness': commit, 'network': network,
+            'proxy': proxy, 'volumes': [workspace, home], 'branch': 'nc-work/' + name, 'github': p['github'],
+            'image_id': output('docker', 'inspect', '--format', '{{.Image}}', 'ncw-' + name), 'claude_auth': 'host-injected-on-demand',
+            'opencode': opencode_ready(name), 'memory': not worker, 'agents': True, 'project_path': project_path}
+    if worker: meta['worker'] = True
+    if from_task is not None: meta.update({'from_task': from_task, 'from_token': from_token})
+    if not worker: meta.update({'broker': True, 'broker_token': secrets.token_hex(16)})
+    save(meta_path, meta)
+    if not quiet: print(json.dumps(meta, indent=2))
+
+def github_remote(p):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*', p['github']):
+        raise ValueError('Invalid fixed GitHub repository')
+    return 'git@github.com:' + p['github'] + '.git'
+
+def publish(m, push=False):
+    # Container contributes objects only, never host Git config, hooks, or a remote URL.
+    name = valid(m['id'])
+    branch = 'nc-work/' + name
+    remote = github_remote(profile(m['project']))
+    with tempfile.TemporaryDirectory(prefix='ncw-publish-') as tmp:
+        bundle = pathlib.Path(tmp) / 'task.bundle'
+        dex(name, '/usr/bin/git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+            'bundle', 'create', '/tmp/nc-publish.bundle', 'refs/heads/' + branch)
+        with bundle.open('wb') as stream:
+            run('docker', 'exec', 'ncw-' + name, '/bin/cat', '/tmp/nc-publish.bundle', stdout=stream)
+        bare = pathlib.Path(tmp) / 'repo.git'
+        run('git', 'init', '--bare', '--template=', bare, capture=True)
+        git = ['git', '-C', bare, '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+               '-c', 'protocol.file.allow=always']
+        run(*git, 'bundle', 'verify', bundle, capture=True)
+        run(*git, 'fetch', bundle, 'refs/heads/' + branch + ':refs/heads/' + branch, capture=True)
+        run(*git, 'push', *([] if push else ['--dry-run']), remote,
+            'refs/heads/' + branch + ':refs/heads/' + branch)
+    print(json.dumps({'repository': profile(m['project'])['github'], 'branch': branch, 'dry_run': not push}))
+
+# nc delegate: `export` hands a worker's branch and RESULT.md to the host. Everything from the container is data:
+# sizes are capped, links are not followed, every docker exec has a timeout, nothing is started or run on the host.
+EXPORT_MAX = 200 * 1024 * 1024
+RESULT_PATH, RESULT_MAX = '/home/agent/.nc/RESULT.md', 64 * 1024
+RESULT_MISSING, RESULT_ERROR, RESULT_TRUNCATED = 3, 4, 5
+# Runs inside the task container as uid 1000: the first 64 KiB of RESULT.md on stdout, only for a regular file whose
+# resolved path is exactly RESULT_PATH. Exit 0 complete, 5 truncated, 3 missing (or a link, or not a file), 4 read error.
+RESULT_READ = '''import errno, os, stat, sys
+path, limit = sys.argv[1], int(sys.argv[2])
+try:
+    if os.path.realpath(path) != path: sys.exit(3)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except OSError as exc:
+    sys.exit(3 if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP) else 4)
+try:
+    if not stat.S_ISREG(os.fstat(fd).st_mode): sys.exit(3)
+    data = b""
+    while len(data) <= limit:
+        chunk = os.read(fd, limit + 1 - len(data))
+        if not chunk: break
+        data += chunk
+except OSError:
+    sys.exit(4)
+sys.stdout.buffer.write(data[:limit])
+sys.stdout.flush()
+sys.exit(5 if len(data) > limit else 0)
+'''
+
+def exec_capped(cmd, dest, limit, timeout):
+    """Run cmd and stream its stdout into the open binary file dest, at most limit bytes, within timeout seconds.
+    Returns (exit code, whether there was more). Raises subprocess.TimeoutExpired; the process never outlives it."""
+    deadline = time.monotonic() + timeout
+    proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    size, over = 0, False
+    try:
+        fd = proc.stdout.fileno()
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0: raise subprocess.TimeoutExpired(cmd, timeout)
+            if not select.select([fd], [], [], left)[0]: continue
+            chunk = os.read(fd, 1 << 16)
+            if not chunk: break
+            if size + len(chunk) > limit:
+                dest.write(chunk[:limit - size]); over = True
+                break
+            dest.write(chunk); size += len(chunk)
+        if over: proc.kill()
+        return proc.wait(timeout=max(1, deadline - time.monotonic())), over
+    finally:
+        if proc.poll() is None: proc.kill(); proc.wait()
+        proc.stdout.close()
+
+def container_exec(name, *cmd, timeout=60):
+    """docker exec as uid 1000 in the task's workspace; a timeout becomes a ValueError."""
+    try:
+        return subprocess.run(['docker', 'exec', '--user', '1000:1000', '-w', '/workspace', 'ncw-' + name, *cmd],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired: raise ValueError(f'{name}: timeout in docker exec ({cmd[0]})')
+
+def exec_failed(name, what, r):
+    return ValueError(f'{name}: {what} ({first_line(r.stderr) or "Exit " + str(r.returncode)})')
+
+def bare_git(bare, *cmd):
+    """Git on a host repo that holds data from a container: no hooks, no fsmonitor, file transport for bundles.
+    At most 300 seconds; a timeout becomes a ValueError."""
+    try:
+        return subprocess.run(['git', '-C', str(bare), '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+                               '-c', 'protocol.file.allow=always', *cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    except subprocess.TimeoutExpired:
+        what = next((c for c in cmd if not c.startswith('-') and '=' not in c), 'git')
+        raise ValueError(f'timeout in git {what}')
+
+def fetch_bundle(name, bare, bundle_refs, refspec, too_big=ValueError, limit=None):
+    """The steps export and create --from-task share. In the container of task `name`, as uid 1000, hooks and fsmonitor
+    off: git bundle create bundle_refs; size check with stat, then a copy capped at EXPORT_MAX (too_big is raised for
+    a bundle over the limit); the bundle in the container is always deleted. On the host: a fresh bare repo at
+    `bare`, bundle verify, fetch --no-tags of refspec with transfer.fsckObjects, then git fsck (each up to 300 s).
+    limit: seconds for every step inside the container (create --from-task: 120); None keeps export's 300 for the bundle
+    and the copy and 60 for the rest."""
+    container, tmp_bundle = 'ncw-' + name, '/tmp/nc-export.bundle'
+    def ex(*cmd, timeout=60): return container_exec(name, *cmd, timeout=limit or timeout)
+    def failed(what, r): return exec_failed(name, what, r)
+    with tempfile.TemporaryDirectory(prefix='ncw-export-') as tmp:
+        bundle = pathlib.Path(tmp) / 'task.bundle'
+        try:
+            r = ex('/usr/bin/git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+                   'bundle', 'create', tmp_bundle, *bundle_refs, timeout=300)
+            if r.returncode: raise failed('bundle not created', r)
+            r = ex('/usr/bin/stat', '-c', '%s', tmp_bundle)
+            size = r.stdout.decode(errors='replace').strip()
+            if r.returncode or not size.isdigit(): raise failed('size of the bundle not readable', r)
+            if int(size) > EXPORT_MAX: raise too_big(f'{name}: bundle larger than {EXPORT_MAX // 2**20} MiB ({size} bytes)')
+            with bundle.open('wb') as stream:
+                try:
+                    code, over = exec_capped(['docker', 'exec', '--user', '1000:1000', container, '/bin/cat', tmp_bundle],
+                                             stream, EXPORT_MAX, limit or 300)
+                except subprocess.TimeoutExpired: raise ValueError(f'{name}: timeout while copying the bundle')
+            if over: raise too_big(f'{name}: bundle larger than {EXPORT_MAX // 2**20} MiB')
+            if code: raise ValueError(f'{name}: bundle not copied (exit {code})')
+        finally:
+            try: ex('/bin/rm', '-f', tmp_bundle)
+            except ValueError: pass
+        r = subprocess.run(['git', 'init', '--bare', '--template=', str(bare)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r.returncode: raise failed('repo.git not created', r)
+        r = bare_git(bare, 'bundle', 'verify', str(bundle))
+        if r.returncode: raise failed('bundle invalid', r)
+        r = bare_git(bare, '-c', 'transfer.fsckObjects=true', '-c', 'gc.auto=0', 'fetch', '--no-tags', str(bundle), refspec)
+        if r.returncode: raise failed('branch not fetched', r)
+        # Git before 2.46 skips transfer.fsckObjects when fetching from a bundle: check the objects explicitly.
+        r = bare_git(bare, 'fsck', '--no-dangling', '--no-progress')
+        if r.returncode: raise failed('bundle contains broken objects', r)
+
+def export(m, out):
+    """Worker tasks only (nc delegate): the branch nc-work/<task> as DIR/repo.git (fetched from a verified bundle,
+    only that ref, then git fsck), RESULT.md as DIR/RESULT.raw and DIR/export.json. Never starts the container."""
+    name = valid(m['id'])
+    if not m.get('worker'): raise ValueError(f'{name}: not a worker task')
+    if container_state(name) != 'running':
+        raise ValueError(f'task {name} is not running – export does not start it')
+    out = pathlib.Path(out)
+    if out.exists() or out.is_symlink(): raise ValueError(f'{out} already exists')
+    out.mkdir(mode=0o700)  # the parent must exist
+    branch = 'nc-work/' + name
+    ref = 'refs/heads/' + branch
+    container = 'ncw-' + name
+    def ex(*cmd, timeout=60): return container_exec(name, *cmd, timeout=timeout)
+    def failed(what, r): return exec_failed(name, what, r)
+    bare = out / 'repo.git'
+    def host_git(*cmd): return bare_git(bare, *cmd)
+    fetch_bundle(name, bare, [ref], f'{ref}:{ref}')
+    r = host_git('rev-parse', '--verify', ref + '^{commit}')
+    if r.returncode: raise failed('branch missing in the bundle', r)
+    head, base = r.stdout.decode().strip(), m['base']
+    ancestor = host_git('merge-base', '--is-ancestor', base, head).returncode == 0
+    commits = int(host_git('rev-list', '--count', f'{base}..{head}').stdout.decode().strip()) if ancestor else None
+    r = ex('/usr/bin/git', '--no-optional-locks', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'status', '--porcelain')
+    if r.returncode: raise failed('git status in the container failed', r)
+    dirty = bool(r.stdout.strip())
+    raw, partial = out / 'RESULT.raw', out / '.RESULT.raw.tmp'
+    try:
+        with partial.open('wb') as stream:
+            code, over = exec_capped(['docker', 'exec', '--user', '1000:1000', container, '/usr/bin/python3', '-I', '-B', '-c',
+                                      RESULT_READ, RESULT_PATH, str(RESULT_MAX)], stream, RESULT_MAX, 60)
+        result = ('truncated' if over or code == RESULT_TRUNCATED else 'present' if code == 0
+                  else 'missing' if code == RESULT_MISSING else 'error')
+    except (OSError, subprocess.TimeoutExpired):
+        result = 'error'
+    if result in ('present', 'truncated'): partial.replace(raw)
+    else: partial.unlink(missing_ok=True)
+    data = {'task': name, 'branch': branch, 'base': base, 'head': head, 'commits': commits, 'dirty': dirty,
+            'base_is_ancestor': ancestor, 'result_file': result}
+    save(out / 'export.json', data)
+    print(json.dumps(data))
+
+def auth_login(project=None):
+    """Run official browser flow in the user's terminal; capture token without copy/paste."""
+    import pty, termios, struct
+    if project is not None: profile(project)
+    if not sys.stdin.isatty(): raise ValueError('Run auth-login in your own interactive SSH terminal')
+    chunks = []
+    def read(fd):
+        # Wide terminal prevents the credential itself being wrapped by the CLI.
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 240, 0, 0))
+        data = os.read(fd, 65536)
+        chunks.append(data)
+        return data
+    print('Complete the official Claude browser login. The token will be saved automatically.')
+    with tempfile.TemporaryDirectory(prefix='ncw-claude-login-') as config:
+        previous = os.environ.get('CLAUDE_CONFIG_DIR')
+        os.environ['CLAUDE_CONFIG_DIR'] = config
+        try:
+            status = pty.spawn([str(pathlib.Path.home() / '.local/bin/claude'), 'setup-token'], master_read=read)
+        finally:
+            if previous is None: os.environ.pop('CLAUDE_CONFIG_DIR', None)
+            else: os.environ['CLAUDE_CONFIG_DIR'] = previous
+    if os.waitstatus_to_exitcode(status): raise ValueError('Claude login did not complete; existing token unchanged')
+    transcript = b''.join(chunks).decode(errors='replace')
+    transcript = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', transcript)
+    tokens = set(re.findall(r'sk-ant-oat01-[A-Za-z0-9_-]+', transcript))
+    if len(tokens) != 1: raise ValueError('Could not identify one complete token; existing token unchanged')
+    store_token(project, tokens.pop())
+
+def store_token(project, token):
+    folder = STATE / 'auth'
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    folder.chmod(0o700)
+    fd, temporary = tempfile.mkstemp(prefix='.token-', dir=folder)
+    with os.fdopen(fd, 'w') as f: f.write(token)
+    os.replace(temporary, folder / (valid(project) + '.token' if project is not None else '.default.token'))
+    print('Model token stored on host with owner-only access; no account login copied.')
+
+def auth_set(project=None):
+    if project is not None: profile(project)
+    if not sys.stdin.isatty(): raise ValueError('Use an interactive terminal; never pass a token in command arguments')
+    token = getpass.getpass('Paste only a token from claude setup-token (hidden): ').strip()
+    if not token.startswith('sk-ant-oat') or any(c.isspace() for c in token):
+        raise ValueError('Expected a Claude setup-token value; no credential JSON or API key')
+    store_token(project, token)
+
+def token_path_for(project):
+    valid(project)
+    folder = STATE / 'auth'
+    override = folder / (project + '.token')
+    path = override if override.exists() else folder / '.default.token'
+    if not path.exists(): raise ValueError('First run nc-work auth-login in your own server terminal')
+    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+        raise ValueError('Token must be an owner-only regular file')
+    return path
+
+def claude(m):
+    token_path = token_path_for(m['project'])
+    if not sys.stdin.isatty(): raise ValueError('Claude starts interactively; use ssh -t')
+    if m.get('memory'): memory_view(m['id'], m['project'])  # each session starts with the current memory
+    extra, warned = [], False
+    if m.get('agents'):  # roles and the orchestrator setting from the host checkout (older tasks have no agents folder)
+        warned = agents_generate(m, 'claude')
+        extra, orchestrator_warned = orchestrator_args()
+        warned = warned or orchestrator_warned
+    # Token authentication is already provisioned; avoid first-run account-login wizard.
+    # This does not disable project trust or tool permission checks.
+    dex(m['id'], '/usr/bin/python3', '-I', '-B', '-c',
+        'import pathlib,json; p=pathlib.Path.home()/".claude.json"; d=json.loads(p.read_text()) if p.exists() else {}; d["hasCompletedOnboarding"]=True; p.write_text(json.dumps(d))', capture=True)
+    env = os.environ.copy()
+    env['CLAUDE_CODE_OAUTH_TOKEN'] = token_path.read_text().strip()
+    # `feed` finds this session from the herdr terminal: host pid -> task here, and the
+    # NC_HOST_PID marker -> the claude process inside the container.
+    marker = STATE / 'sessions' / (str(os.getpid()) + '.json')
+    save(marker, {'task': m['id'], 'pid': os.getpid()})
+    try:
+        pause_after_warning(warned)
+        # Docker reads the token from its environment; it is absent from argv and container configuration.
+        result = subprocess.run(['docker', 'exec', '-it', '-w', '/workspace', '-e', 'CLAUDE_CODE_OAUTH_TOKEN',
+            '-e', f'NC_HOST_PID={os.getpid()}', 'ncw-' + m['id'], '/usr/local/bin/claude', *extra], env=env)
+    finally:
+        marker.unlink(missing_ok=True)
+    if result.returncode: raise ValueError('Claude exited unsuccessfully; token was not printed')
+
+def secrets_value(name):
+    """The parsed value of `name` in secrets.env, '' if the name is missing. Same rule as nc-harness (cli/opencode.sh,
+    nc doctor): trim the line (BOM, CR, ASCII whitespace), optional `export `, trim the value, strip one pair of matching
+    quotes, last line wins."""
+    ws = ' \t\n\v\f\r'
+    key = ''
+    for line in SECRETS.read_text().split('\n'):
+        line = line.lstrip('\ufeff').replace('\r', '').strip(ws)
+        found = re.fullmatch(r'(?:export[ \t\v\f]+)?' + re.escape(name) + r'=(.*)', line, re.S)  # not NAME_SUFFIX=
+        if not found: continue
+        key = found.group(1).strip(ws)
+        if len(key) >= 2 and key[0] == key[-1] and key[0] in '"\'': key = key[1:-1]
+    return key
+
+def openrouter_key(name=KEY_DEFAULT):
+    """The value of `name` (OPENROUTER_API_KEY or OPENROUTER_API_KEY_CLIENTS) from nc-harness' secrets.env. Parsed,
+    never sourced; no other value is read or passed on. Messages name the variable, never the value. The value must be
+    printable ASCII without spaces (no comments, no pasted non-breaking spaces)."""
+    if not SECRETS.exists(): raise ValueError('~/.config/nc-harness/secrets.env is missing (install.sh of nc-harness creates it)')
+    if SECRETS.is_symlink() or not SECRETS.is_file() or SECRETS.stat().st_mode & 0o077:
+        raise ValueError('secrets.env must be an owner-only regular file (chmod 600)')
+    then = f' – {CLIENTS_ONLY}' if name == KEY_CLIENTS else ''
+    key = secrets_value(name)
+    if not key: raise ValueError(f'{name} missing in ~/.config/nc-harness/secrets.env{then}')
+    if not re.fullmatch(r'[\x21-\x7e]+', key): raise ValueError(f'{name} in secrets.env is malformed; value not printed{then}')
+    return key
+
+def project_path_of(m):
+    """The task's folder below ~/projects: recorded in the task, otherwise (older tasks) the one of its profile."""
+    if m.get('project_path'): return m['project_path']
+    try: return profile(m['project'])['path']
+    except (OSError, KeyError, TypeError, ValueError, AssertionError):
+        raise ValueError(f'task {m.get("id")}: project path unknown (no project_path, no profile) – OpenCode does not start')
+
+def opencode_policy(project_path):
+    """`nc models --json --path` for the project's host folder, from the host's harness checkout (never the
+    snapshot), like orchestrator_args. Anything unusable stops OpenCode: without the policy no key can be chosen."""
+    try:
+        r = subprocess.run([str(HARNESS / 'bin/nc'), 'models', '--json', '--path', str(pathlib.Path.home() / 'projects' / project_path)],
+                           cwd='/', timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.TimeoutExpired: reason = 'timeout'
+    except OSError as exc: reason = str(exc)
+    else:
+        if r.returncode: reason = f'nc models: Exit {r.returncode}' + (f', {line}' if (line := first_line(r.stderr)) else '')
+        else:
+            try: data = json.loads(r.stdout)
+            except ValueError: data, reason = None, 'no valid JSON output'
+            else: reason = 'policy.deny_classes is not a list'
+            if isinstance(data, dict) and isinstance(data.get('policy'), dict) and isinstance(data['policy'].get('deny_classes'), list):
+                # an older harness writes no require: treat it as empty.
+                req = data['policy'].setdefault('require', [])
+                if isinstance(req, list) and all(isinstance(v, str) for v in req): return data
+                reason = 'policy.require is not a list of strings'
+    raise ValueError(f'policy for ~/projects/{project_path} not read ({reason}) – OpenCode does not start')
+
+def opencode_setup(project_path):
+    """(key, config for OPENCODE_CONFIG_CONTENT) for an OpenCode start in this project; the key goes only into the run's
+    key proxy. A policy that denies free gets OPENROUTER_API_KEY_CLIENTS only: OpenRouter then refuses every model
+    outside the workspace's guardrail, whatever the session, an agent file or a delegation asks for. The same holds for
+    a policy with require: no-training (the workspace's guardrail has training and publication off). Default and title
+    model come from the classes standard and cheap where they are allowed (OpenCode would otherwise pick its own,
+    blocked by that key)."""
+    data = opencode_policy(project_path)
+    pol = data['policy']
+    clients = 'free' in pol['deny_classes'] or 'no-training' in pol.get('require', [])
+    key = openrouter_key(KEY_CLIENTS) if clients else openrouter_key(KEY_DEFAULT)
+    classes = data.get('classes') if isinstance(data.get('classes'), dict) else {}
+    config = {}
+    for name, field in [('standard', 'model'), ('cheap', 'small_model')]:
+        c = classes.get(name)
+        if isinstance(c, dict) and c.get('allowed') is True and isinstance(c.get('model'), str) and c['model']:
+            config[field] = c['model']
+    return key, config
+
+# The task can run OpenCode safely: binary in the image, and the harness snapshot brings the config that allows
+# only OpenRouter and turns OpenCode's shared background server off (it would keep the key after the run).
+OPENCODE_READY = ('test -x /usr/local/bin/opencode && test -f /opt/nc-harness/adapters/opencode/opencode.json '
+                  '&& test -f /opt/nc-harness/adapters/opencode/service.json')
+
+def opencode_ready(name):
+    return subprocess.run(['docker', 'exec', 'ncw-' + name, '/bin/sh', '-c', OPENCODE_READY],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+# The search the two scripts below share, run inside the task container: pid -> run id for every process that
+# carries an NC_OPENCODE_RUN marker.
+OPENCODE_RUNS = '''import os, signal, sys, time
+def runs():
+    found = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) == os.getpid(): continue
+        try: env = open("/proc/%s/environ" % d, "rb").read().split(b"\\0")
+        except OSError: continue
+        for e in env:
+            if e.startswith(b"NC_OPENCODE_RUN="): found[int(d)] = e[16:].decode(errors="replace")
+    return found
+'''
+# Runs inside the task container after an OpenCode run: ends every process that carries this run's marker
+# (OpenCode, its private server, whatever its tools left behind). `docker exec` does not end them when the
+# host client dies (SSH drop, closed pane, timeout), and they would go on working without anyone watching.
+OPENCODE_REAP = OPENCODE_RUNS + '''def marked(): return [pid for pid, run in runs().items() if run == sys.argv[1]]
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    pids = marked()
+    if not pids: break
+    for pid in pids:
+        try: os.kill(pid, sig)
+        except OSError: pass
+    time.sleep(1.5)
+sys.exit(1 if marked() else 0)
+'''
+# Runs inside the task container: the run ids that still have a live process (for keyproxy_sweep).
+OPENCODE_LIVE = OPENCODE_RUNS + 'print("\\n".join(sorted(set(runs().values()))))\n'
+
+# Key proxy: every `nc-work opencode` starts keyproxy/keyproxy.py as a container of its own in the
+# task's network. OpenCode gets only this placeholder and the proxy's address; the proxy gets the real key on stdin and
+# adds it on the way to openrouter.ai (through the task's egress proxy). No agent container holds the key any more.
+KEY_PLACEHOLDER = 'nc-keyproxy'
+KEYPROXY_MOUNT, KEYPROXY_PORT, KEYPROXY_READY = '/opt/nc-keyproxy', 8080, 15  # path in the proxy container, port, seconds
+KEYPROXY_PING = ('import http.client, sys\nc = http.client.HTTPConnection("127.0.0.1", 8080, timeout=2)\n'
+                 'c.request("GET", "/__ready")\nsys.exit(0 if c.getresponse().status == 200 else 1)\n')
+OFFLINE = 'offline: no OpenCode (the key proxy needs the task\'s network)'
+
+def offline(m): return m.get('network', 'none') == 'none' or not m.get('proxy')
+
+def keyproxy_name(name, run_id): return f'ncw-{name}-key-{run_id}'
+
+def keyproxy_script():
+    """keyproxy.py copied to STATE/keyproxy before every start (folder 0755, file 0644, like the memory view), so the
+    subuid of the proxy container can read it whatever the umask of the checkout."""
+    folder = STATE / 'keyproxy'
+    if folder.is_symlink(): raise ValueError(f'{folder} is a link – OpenCode does not start')
+    folder.mkdir(parents=True, exist_ok=True); folder.chmod(0o755)
+    tmp = folder / f'.keyproxy.py.{os.getpid()}.tmp'
+    shutil.copyfile(ROOT / 'keyproxy' / 'keyproxy.py', tmp); tmp.chmod(0o644)
+    tmp.replace(folder / 'keyproxy.py')
+    return folder
+
+def keyproxy_lock_path(name, run_id): return STATE / 'keyproxy-runs' / f'{name}.{run_id}.lock'
+
+def keyproxy_lock(name, run_id):
+    """Held by the nc-work process of a run from before its proxy starts until it is gone: keyproxy_sweep never
+    takes the proxy of a run whose OpenCode has not started yet. After a SIGKILL the empty file stays until a sweep
+    finds the run's proxy or remove deletes the task."""
+    path = keyproxy_lock_path(name, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True); path.parent.chmod(0o700)
+    lock = path.open('a')
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+def keyproxy_held(name, run_id):
+    path = keyproxy_lock_path(name, run_id)
+    if not path.is_file(): return False
+    with path.open('a') as lock:
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: return True
+    path.unlink(missing_ok=True)  # a lock nobody holds: its run is over
+    return False
+
+def opencode_live_runs(name):
+    """Run ids with a live process in the task container (the search of OPENCODE_REAP), or None if that is unknown."""
+    try: r = subprocess.run(['docker', 'exec', 'ncw-' + name, '/usr/bin/python3', '-I', '-B', '-c', OPENCODE_LIVE],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.TimeoutExpired): return None
+    if r.returncode or not isinstance(r.stdout, bytes): return None
+    return set(r.stdout.decode(errors='replace').split())
+
+def keyproxy_sweep(name, orphans_only=False):
+    """Remove the key proxies of task `name` (docker ps -a, label task=). All of them for stop, make_room and remove;
+    with orphans_only (start of every nc-work opencode) those whose run has neither its nc-work process (run lock)
+    nor a live process with its marker in the task container, so a proxy left after a SIGKILL is not usable for days."""
+    r = subprocess.run(['docker', 'ps', '-a', '--filter', f'label={LABEL}.task={name}', '--filter', f'label={LABEL}.kind=keyproxy',
+                        '--format', '{{.Names}} {{.Label "' + LABEL + '.run"}}'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    found = []
+    for line in (r.stdout.decode(errors='replace').splitlines() if r.returncode == 0 and isinstance(r.stdout, bytes) else []):
+        container, _, run_id = line.partition(' ')
+        if not container.startswith(f'ncw-{name}-key-'): continue
+        found.append((container, run_id if re.fullmatch(r'[0-9a-f]{16}', run_id) and container == keyproxy_name(name, run_id) else None))
+    if found and orphans_only:
+        live = opencode_live_runs(name)
+        if live is None:  # unknown (the search in the container failed): keep them, stop and remove take them all
+            print(f'nc-work: orphaned key proxies in {name} not checked (search in the container failed); nc-work stop {name} removes them', file=sys.stderr)
+            return
+        found = [(c, run_id) for c, run_id in found if not run_id or (run_id not in live and not keyproxy_held(name, run_id))]
+    for container, _ in found:
+        try: subprocess.run(['docker', 'rm', '-f', container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            print(f'nc-work: key proxy {container} not removed; nc-work stop {name}', file=sys.stderr)
+
+def keyproxy_start(m, key, run_id, started):
+    """docker run -i of the proxy for this run; the key goes in as one line on stdin, then stdin is closed. It is never in
+    argv and never in an environment of Docker, so neither docker inspect nor a docker exec shows it. The process goes into
+    `started` right away, so a signal before this returns still lets the caller end docker run (keyproxy_stop)."""
+    name, folder = m['id'], keyproxy_script()
+    image = output('docker', 'inspect', '--format', '{{.Image}}', 'ncw-' + name)  # the task's own image
+    proc = subprocess.Popen(['docker', 'run', '-i', '--name', keyproxy_name(name, run_id),
+        '--label', f'{LABEL}.kind=keyproxy', '--label', f'{LABEL}.project={m["project"]}', '--label', f'{LABEL}.task={name}',
+        '--label', f'{LABEL}.run={run_id}', '--network', m['network'], '--network-alias', 'key-' + run_id,
+        '--user', '1000:1000', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--read-only', '--init',
+        '--memory', '256m', '--pids-limit', '64', '--ulimit', 'core=0', '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=1m',
+        '--mount', f'type=bind,src={folder},dst={KEYPROXY_MOUNT},readonly',
+        '--entrypoint', '/usr/bin/python3', image, '-I', '-B', f'{KEYPROXY_MOUNT}/keyproxy.py'],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    started.append(proc)
+    try:
+        proc.stdin.write(key.encode() + b'\n'); proc.stdin.close()
+    except OSError: pass  # docker run ended already; keyproxy_wait finds out
+    return proc
+
+def keyproxy_wait(name, run_id, proc):
+    """At most KEYPROXY_READY seconds for GET /__ready, asked inside the proxy container. No fallback to the key."""
+    deadline = time.monotonic() + KEYPROXY_READY
+    while proc.poll() is None:
+        try:
+            if subprocess.run(['docker', 'exec', keyproxy_name(name, run_id), '/usr/bin/python3', '-I', '-B', '-c', KEYPROXY_PING],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode == 0: return
+        except (OSError, subprocess.TimeoutExpired): pass
+        if time.monotonic() >= deadline: break
+        time.sleep(0.5)
+    raise ValueError(f'key proxy for {name} not ready – OpenCode does not start')
+
+def keyproxy_stop(name, run_id, proc):
+    """By its fixed name, so it also works when docker run was cut short before it printed an id: remove, end docker run,
+    remove again (without a process to end, after a pause, in case the daemon was still creating it). If the container is
+    still there or Docker does not answer, say so."""
+    container = keyproxy_name(name, run_id)
+    def remove():
+        try: subprocess.run(['docker', 'rm', '-f', container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired): pass
+    remove()
+    if proc is None: time.sleep(2)
+    else:
+        if proc.poll() is None: proc.kill()
+        try: proc.wait(timeout=10)
+        except subprocess.TimeoutExpired: pass
+    remove()
+    try:
+        r = subprocess.run(['docker', 'ps', '-aq', '--filter', f'name=^/{container}$'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+        left = r.returncode != 0 or (isinstance(r.stdout, bytes) and r.stdout.strip() != b'')
+    except (OSError, subprocess.TimeoutExpired): left = True
+    if left: print(f'nc-work: key proxy {container} maybe not removed; nc-work stop {name}', file=sys.stderr)
+
+def opencode(m, args=(), stdin=False):
+    """OpenCode in the task container. Which key depends on the project's policy (opencode_setup), but the key goes only
+    into this run's key proxy; OpenCode gets the placeholder nc-keyproxy and, in OPENCODE_CONFIG_CONTENT, the proxy's
+    address as base URL (it wins over an opencode.json in the repo). No proxy, no OpenCode: there is no fallback to the
+    key. Interactive in a terminal, otherwise e.g. `run …`. stdin=True passes piped input on (`--stdin`); otherwise `run`
+    would wait for an inherited pipe to close."""
+    if offline(m): raise ValueError(OFFLINE)
+    key, config = opencode_setup(project_path_of(m))
+    if m.get('memory'): memory_view(m['id'], m['project'])  # each session starts with the current memory
+    if container_state(m['id']) != 'running':
+        raise ValueError(f'task {m["id"]} is not running: nc-work start {m["id"]}')
+    if not opencode_ready(m['id']):
+        raise ValueError(f'task {m["id"]} has no OpenCode (old image or harness snapshot without '
+                         'adapters/opencode); create a new task')
+    warned = m.get('agents') and agents_generate(m, 'opencode')
+    made = subprocess.run(['docker', 'exec', '--user', '1000:1000', 'ncw-' + m['id'], '/usr/bin/mkdir', '-p', '-m', '700', OPENCODE_TMP],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if made.returncode:
+        raise ValueError(f'{OPENCODE_TMP} not created in task {m["id"]} ({first_line(made.stderr) or "Exit " + str(made.returncode)}) – OpenCode does not start')
+    run_id = secrets.token_hex(8)  # not secret: names this run's key proxy and marks its processes for the clean-up
+    alias = 'key-' + run_id
+    config = dict(config, provider={'openrouter': {'options': {'baseURL': f'http://{alias}:{KEYPROXY_PORT}/api/v1'}}})
+    no_proxy = 'localhost,127.0.0.1,' + alias  # else OpenCode sends the http:// base URL to the egress proxy
+    env = os.environ.copy()
+    env.update({'OPENROUTER_API_KEY': KEY_PLACEHOLDER, 'TMPDIR': OPENCODE_TMP, 'NO_PROXY': no_proxy, 'no_proxy': no_proxy,
+                'OPENCODE_CONFIG_CONTENT': json.dumps(config, separators=(',', ':'))})
+    # -t only when both ends are a terminal (redirected output stays clean). Input only when asked for: OpenCode's
+    # `run` reads a piped stdin to EOF, and an inherited pipe that never closes (ssh, agent tools) would hang it.
+    if sys.stdin.isatty() and sys.stdout.isatty(): flags = ['-it']
+    elif stdin: flags = ['-i']
+    else: flags = []
+    def leave(signum, frame): raise SystemExit(128 + signum)
+    pause_after_warning(warned)
+    # First the handlers: end the run cleanly on SIGTERM/SIGHUP, but keep an ignored SIGHUP ignored (nohup).
+    previous = {sig: signal.signal(sig, leave) for sig in (signal.SIGTERM, signal.SIGHUP)
+                if signal.getsignal(sig) is not signal.SIG_IGN}
+    started, lock = [], None
+    try:
+        lock = keyproxy_lock(m['id'], run_id)
+        keyproxy_sweep(m['id'], orphans_only=True)
+        keyproxy_start(m, key, run_id, started)
+        keyproxy_wait(m['id'], run_id, started[0])
+        result = subprocess.run(['docker', 'exec', *flags, '-w', '/workspace', '-e', 'OPENROUTER_API_KEY', '-e', 'TMPDIR',
+            '-e', 'OPENCODE_CONFIG_CONTENT', '-e', 'NO_PROXY', '-e', 'no_proxy', '-e', 'NC_OPENCODE_RUN=' + run_id,
+            'ncw-' + m['id'], '/usr/local/bin/opencode', *args], env=env)
+    finally:
+        # The clean-up is not cut short by a second signal: first the run's own proxy, then its processes.
+        quiet = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (*previous, signal.SIGINT)}
+        try:
+            keyproxy_stop(m['id'], run_id, started[0] if started else None)
+            try:
+                reaped = subprocess.run(['docker', 'exec', 'ncw-' + m['id'], '/usr/bin/python3', '-I', '-B', '-c', OPENCODE_REAP, run_id],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                reaped = False
+            # A container that stopped meanwhile has no processes left.
+            if not reaped and container_state(m['id']) == 'running':
+                print(f'nc-work: OpenCode processes in {m["id"]} maybe not ended; nc-work stop {m["id"]}', file=sys.stderr)
+            if lock:
+                keyproxy_lock_path(m['id'], run_id).unlink(missing_ok=True); lock.close()
+        finally:
+            for sig, handler in quiet.items(): signal.signal(sig, previous.get(sig, handler))
+    if result.returncode: raise ValueError('OpenCode exited unsuccessfully; key was not printed')
+
+def ancestors(pid):
+    """pid and its parents, nearest first (Linux /proc)."""
+    chain = []
+    while pid > 1 and pid not in chain and len(chain) < 64:
+        chain.append(pid)
+        try: stat = pathlib.Path(f'/proc/{pid}/stat').read_text()
+        except OSError: break
+        pid = int(stat.rsplit(')', 1)[1].split()[1])
+    return chain
+
+def session_of(pid):
+    """The task whose `nc-work claude` runs in the same process line as pid (herdr's foreground
+    process can be nc-work itself, its docker child or the shell that started it)."""
+    folder = STATE / 'sessions'
+    for f in sorted(folder.glob('*.json')) if folder.exists() else []:
+        if not f.stem.isdigit(): continue
+        host = int(f.stem)
+        if not pathlib.Path(f'/proc/{host}').exists():
+            f.unlink(missing_ok=True); continue
+        if host in ancestors(pid) or pid in ancestors(host):
+            try: return valid(json.loads(f.read_text())['task']), host
+            except (OSError, ValueError, KeyError): continue
+    return None, None
+
+# Runs inside the task container: finds the claude process that carries NC_HOST_PID=<host pid>
+# and runs the usage script handed over by herdr against it. Only reads /proc and ~/.claude.
+FEED_BOOT = '''import os, sys
+marker, script, rest = b"NC_HOST_PID=" + sys.argv[1].encode(), sys.argv[2], sys.argv[3:]
+found = None
+for d in sorted((d for d in os.listdir("/proc") if d.isdigit()), key=int):
+    try:
+        env = open("/proc/%s/environ" % d, "rb").read().split(b"\\0")
+        argv0 = open("/proc/%s/cmdline" % d, "rb").read().split(b"\\0")[0]
+    except OSError:
+        continue
+    if marker in env and os.path.basename(argv0) == b"claude":
+        found = d
+        break
+if found is None:
+    print('{"v": 1, "sig": "", "error": "no-session"}')
+    sys.exit(0)
+sys.argv = ["usage.py", "--pid", found] + rest
+exec(compile(script, "usage.py", "exec"), {"__name__": "__main__"})
+'''
+
+def feed(pid, script, rest):
+    """For herdr's usage cards: run `script` (nc-session's usage.py) against the isolated Claude
+    session in the terminal whose foreground process is `pid`. Prints the script's JSON."""
+    name, host = session_of(pid)
+    if name is None:
+        print(json.dumps({'v': 1, 'sig': '', 'error': 'not-isolated'})); return
+    r = subprocess.run(['docker', 'exec', 'ncw-' + name, '/usr/bin/python3', '-I', '-B', '-c', FEED_BOOT,
+                        str(host), script, *rest], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+    sys.stdout.write(r.stdout.decode(errors='replace'))
+    if r.returncode:
+        sys.stderr.write(r.stderr.decode(errors='replace')); raise ValueError(f'feed in {name} exited {r.returncode}')
+
+def all_profiles():
+    names = {f.stem for folder in PROFILE_DIRS for f in folder.glob('*.json') if not f.name.startswith('.')}
+    return [profile(n) for n in sorted(names)]
+
+def project_for(folder):
+    """The profile whose checkout contains `folder` (deepest match), or None."""
+    folder = pathlib.Path(folder).resolve()
+    best = None
+    for p in all_profiles():
+        source = (pathlib.Path.home() / 'projects' / p['path']).resolve()
+        if folder.is_relative_to(source) and (best is None or len(source.parts) > len(best[1].parts)):
+            best = (p, source)
+    return best[0] if best else None
+
+def tasks_of(project_id):
+    folder = STATE / 'tasks'
+    found = []
+    for f in sorted(folder.glob('*.json')) if folder.exists() else []:
+        try: m = json.loads(f.read_text())
+        except (OSError, ValueError): continue
+        if m.get('project') == project_id and m.get('id') == f.stem: found.append(m)
+    return found
+
+def container_state(name):
+    r = subprocess.run(['docker', 'inspect', '--format', '{{.State.Running}}', 'ncw-' + name],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if r.returncode: return 'missing'
+    return 'running' if r.stdout.strip() == b'true' else 'stopped'
+
+def running_agents():
+    names = output('docker', 'ps', '--filter', f'label={LABEL}.kind=agent', '--format', '{{.Names}}').splitlines()
+    return [n[len('ncw-'):] for n in names if n.startswith('ncw-')]
+
+def ask(prompt, default=''):
+    try: answer = input(prompt).strip()
+    except EOFError: raise ValueError('cancelled')
+    return answer or default
+
+def make_room():
+    """At most three agent containers run. Offer to stop one instead of failing."""
+    running = running_agents()
+    if len(running) < 3: return
+    print('\nThree tasks are already running. Stop one (its data stays):')
+    for i, n in enumerate(running, 1): print(f'  {i}  {n}')
+    choice = ask('Number, or Enter to cancel: ')
+    if not choice.isdigit() or not 1 <= int(choice) <= len(running): raise ValueError('cancelled')
+    name = running[int(choice) - 1]
+    meta = STATE / 'tasks' / (name + '.json')
+    proxy = json.loads(meta.read_text()).get('proxy') if meta.exists() else None
+    run('docker', 'stop', 'ncw-' + name, capture=True)
+    if proxy: run('docker', 'stop', proxy, capture=True)
+    keyproxy_sweep(name)  # with the task stopped no run is left to use them
+
+def report(m):
+    """After Claude exits: what is in the task that is not on GitHub or in the memory yet."""
+    if (pending := memory_pending(m['id'])):
+        print(f'\nTask {m["id"]}: {pending} memory request(s) in the outbox. Apply: nc-work memory-apply {m["id"]}')
+    try:
+        dirty = dex(m['id'], '/usr/bin/git', '--no-optional-locks', 'status', '--porcelain', capture=True).stdout.decode().strip()
+        new = dex(m['id'], '/usr/bin/git', 'rev-list', '--count', m['base'] + '..HEAD', capture=True).stdout.decode().strip()
+    except (subprocess.CalledProcessError, KeyError):
+        return
+    print(f'\nTask {m["id"]} (branch {m["branch"]}): {new} commit(s) since the start.')
+    if dirty: print('Note: uncommitted changes in the container.')
+    if new != '0': print(f'Upload to GitHub: nc-work publish {m["id"]} --push')
+
+RUNTIMES = {'claude': 'Claude', 'opencode': 'OpenCode'}
+
+def snapshot_has_opencode():
+    """New tasks get the current harness snapshot; it must bring OpenCode's config (see OPENCODE_READY)."""
+    current = STATE / 'harness-current.json'
+    if not current.exists(): return False
+    folder = STATE / 'harness' / json.loads(current.read_text())['commit'] / 'adapters/opencode'
+    return (folder / 'opencode.json').is_file() and (folder / 'service.json').is_file()
+
+def here(project_id=None, lock=None, runtime='claude'):
+    """Pick or create a task for the project of the current folder, then start Claude or OpenCode in it."""
+    if runtime not in RUNTIMES: raise ValueError('runtime: claude or opencode')
+    if not sys.stdin.isatty(): raise ValueError(f'{RUNTIMES[runtime]} starts interactively; use a terminal')
+    p = profile(project_id) if project_id else project_for(os.getcwd())
+    if p is None:
+        raise ValueError(f'No nc-work profile for {os.getcwd()}. Use plain "Claude Code" here.')
+    if runtime == 'opencode': opencode_setup(p['path'])  # policy and key of this project: refuse before asking or creating
+    tasks = tasks_of(p['id'])
+    states = {m['id']: container_state(m['id']) for m in tasks}
+    label = {'running': 'running', 'stopped': 'stopped', 'missing': 'container missing'}
+    print(f'{RUNTIMES[runtime]} (isolated) · project {p["id"]}\n')
+    usable = []
+    for m in tasks:
+        if m.get('status', 'ready') != 'ready' or states[m['id']] == 'missing':
+            print(f'     {m["id"]:<28} {"failed" if m.get("status") == "failed" else label["missing"]}')
+            continue
+        if runtime == 'opencode' and not m.get('opencode'):
+            print(f'     {m["id"]:<28} without OpenCode (older image or snapshot)')
+            continue
+        if runtime == 'opencode' and offline(m):  # the key proxy needs the task's network
+            print(f'     {m["id"]:<28} offline (no OpenCode)')
+            continue
+        usable.append(m)
+        print(f'  {len(usable):>2} {m["id"]:<28} {label[states[m["id"]]]}')
+    print('   n new task\n   q cancel\n')
+    choice = ask('Choice [n]: ', 'n').lower()
+    if choice == 'q': raise ValueError('cancelled')
+    # Starting and creating are serialized like `start`/`create`; the Claude session is not.
+    if lock: fcntl.flock(lock, fcntl.LOCK_EX)
+    if choice.isdigit() and 1 <= int(choice) <= len(usable):
+        m = usable[int(choice) - 1]
+        if states[m['id']] != 'running':
+            make_room()
+            if m.get('agents'): agents_folders(m['id'])  # a missing bind source would stop docker start
+            if m.get('broker'): broker_folders(m['id'])
+            if m.get('proxy'): run('docker', 'start', m['proxy'], capture=True)
+            run('docker', 'start', 'ncw-' + m['id'], capture=True)
+    elif choice == 'n':
+        if runtime == 'opencode' and not snapshot_has_opencode():
+            raise ValueError('The current harness snapshot has no adapters/opencode; first run nc-work snapshot '
+                             'from a harness state with OpenCode configuration')
+        source = pathlib.Path.home() / 'projects' / p['path']
+        if output('git', '-C', source, 'status', '--porcelain'):
+            raise ValueError(f'~/projects/{p["path"]} has local changes. Commit or stash first; '
+                             'a task always starts from the last commit.')
+        suggestion = (p['id'][:29] + '-' + time.strftime('%m%d-%H%M'))
+        name = valid(ask(f'Task name [{suggestion}]: ', suggestion))
+        if (STATE / 'tasks' / (name + '.json')).exists(): raise ValueError(f'task {name} already exists')
+        make_room()
+        print('Creating container …')
+        create(p, name, quiet=True)
+        m = task(name)
+    else:
+        raise ValueError('No valid choice')
+    if lock: fcntl.flock(lock, fcntl.LOCK_UN)
+    try:
+        opencode(m) if runtime == 'opencode' else claude(m)
+    finally:
+        report(m)
+
+def workspace_git(work, *cmd):
+    """Git on the task's workspace volume, mounted read-only and offline; stdout or None."""
+    r = subprocess.run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'git',
+        '--mount', f'type=volume,src={work},dst=/workspace,readonly', IMAGE,
+        '--no-optional-locks', '-C', '/workspace', *cmd], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return r.stdout.decode().strip() if r.returncode == 0 else None
+
+def unpublished(name, m, work):
+    """Why the task's workspace may hold work that is not on GitHub, or None."""
+    head = workspace_git(work, 'rev-parse', 'refs/heads/' + m['branch'])
+    dirty = workspace_git(work, 'status', '--porcelain')
+    if head is None or dirty is None: return 'workspace not readable'
+    if dirty: return 'uncommitted changes'
+    if head != m['base']:
+        remote = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', 'ls-remote', github_remote(profile(m['project'])),
+                                 'refs/heads/' + m['branch']], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout.decode().split()
+        if not remote or remote[0] != head: return f'commits are not on GitHub (nc-work publish {name} --push)'
+    return None
+
+def undelivered(m, work, sha):
+    """For remove --delivered: why a worker task's workspace may hold more than the delivered commit sha, or None."""
+    head = workspace_git(work, 'rev-parse', 'refs/heads/' + (m.get('branch') or 'nc-work/' + m['id']))
+    dirty = workspace_git(work, 'status', '--porcelain')
+    if head is None or dirty is None: return 'workspace not readable'
+    if dirty: return 'uncommitted changes'
+    if head != sha: return f'branch is at {head}, collected is {sha}'
+    return None
+
+def remove(name, force=False, discard_memory=False, delivered=None, discard_requests=False):
+    """Delete a task: containers, network, volumes, state. Refuses if work may be unpublished or memory requests
+    wait; names every reason. discard_memory drops waiting or rejected requests but keeps the work check;
+    discard_requests does the same for the requests in the task's nc delegate mailbox.
+    delivered=SHA (worker tasks of nc delegate): no GitHub check; the branch must be exactly SHA, the workspace clean."""
+    valid(name)
+    meta_path = STATE / 'tasks' / (name + '.json')
+    m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    work = (m.get('volumes') or ['ncw-' + name + '-work'])[0]
+    has_work = subprocess.run(['docker', 'volume', 'inspect', work], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    reasons = []
+    # Without Docker every volume looks absent and the work check would pass silently (also with --discard-memory).
+    docker_up = subprocess.run(['docker', 'version', '--format', '{{.Server.Version}}'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if not force and not docker_up: reasons.append('Docker does not answer – work check not possible')
+    if delivered is not None:
+        if not m.get('worker'): reasons.append('not a worker task (--delivered is only for nc delegate)')
+        elif docker_up and not has_work: reasons.append('workspace not readable')
+        elif docker_up and (why := undelivered(m, work, delivered)): reasons.append(why)
+    elif not force and docker_up and has_work and m.get('base') and m.get('branch') and m.get('project'):
+        if (why := unpublished(name, m, work)): reasons.append(why)
+    if not force and not discard_memory and (pending := memory_pending(name)):
+        reasons.append(f'{pending} memory request(s) in the outbox (apply: nc-work memory-apply {name}; '
+                       f'discard: nc-work remove {name} --discard-memory, refused ones are in {memory_paths(name)[1]} with a .reason file)')
+    if not force and not discard_requests and (pending := broker_pending(name)):
+        reasons.append(f'{pending} request(s) in the mailbox (nc delegate, nc memory) (discard: nc-work remove {name} --discard-requests, '
+                       f'they are in {broker_paths(name)[1]})')
+    if reasons:
+        raise ValueError(f'{name}: not deleted – ' + '; '.join(reasons) + '. Use --force to delete anyway (discards everything)')
+    def quiet(*cmd): return subprocess.run(list(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    by_label = f'label={LABEL}.task={name}'
+    def ident(kind, ref):  # full ID, so a thing found by label and by name counts once
+        r = quiet('docker', *kind, 'inspect', '--format', '{{.Id}}', ref)
+        return r.stdout.decode().strip() if r.returncode == 0 else None
+    containers = set(quiet('docker', 'ps', '-aq', '--no-trunc', '--filter', by_label).stdout.decode().split())
+    containers |= {i for c in ['ncw-' + name, m.get('proxy') or 'ncw-' + name + '-egress'] if (i := ident([], c))}
+    for c in containers: quiet('docker', 'rm', '-f', c)
+    networks = set(quiet('docker', 'network', 'ls', '-q', '--no-trunc', '--filter', by_label).stdout.decode().split())
+    if (i := ident(['network'], 'ncw-' + name)): networks.add(i)
+    for n in networks: quiet('docker', 'network', 'rm', n)
+    volumes = set(quiet('docker', 'volume', 'ls', '-q', '--filter', by_label).stdout.decode().split())
+    volumes |= {v for v in (m.get('volumes') or ['ncw-' + name + '-work', 'ncw-' + name + '-home'])
+                if quiet('docker', 'volume', 'inspect', v).returncode == 0}
+    for v in volumes: quiet('docker', 'volume', 'rm', v)
+    memory = STATE / 'memory' / name  # before the task file: if this fails, remove can simply run again
+    if memory.exists():
+        try: shutil.rmtree(memory)
+        except PermissionError:  # folders the container made in its outbox belong to a subuid: remove them as container root
+            quiet('docker', 'run', '--rm', '--network', 'none', '--user', '0:0', '--entrypoint', '/bin/rm',
+                  '--mount', f'type=bind,src={memory},dst=/m', IMAGE, '-rf', '/m/view', '/m/outbox')
+            shutil.rmtree(memory)
+    mailbox = STATE / 'broker' / name  # before the task file, like the memory: if this fails, remove can run again
+    if mailbox.is_symlink(): mailbox.unlink()
+    elif mailbox.exists():
+        try: shutil.rmtree(mailbox)
+        except PermissionError:  # the container can make files and folders in requests as a subuid: remove them as container root
+            quiet('docker', 'run', '--rm', '--network', 'none', '--user', '0:0', '--entrypoint', '/bin/rm',
+                  '--mount', f'type=bind,src={mailbox},dst=/m', IMAGE, '-rf', '/m/requests', '/m/inbox')
+            shutil.rmtree(mailbox)
+    staged = STATE / 'broker-runs' / 'staging' / name  # the broker's own copies of its requests
+    if staged.is_dir() and not staged.is_symlink(): shutil.rmtree(staged, ignore_errors=True)
+    agents = STATE / 'agents' / name  # generated, can be made again: no reason to refuse
+    if agents.exists() or agents.is_symlink():
+        try:
+            if agents.is_symlink() or not agents.is_dir(): agents.unlink()
+            else:
+                with (agents / '.lock').open('a') as lock:  # not while a session start generates
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    shutil.rmtree(agents)
+        except OSError as exc:
+            print(f'nc-work: {name}: agents folder {agents} not deleted ({exc}) – run nc-work remove {name} again', file=sys.stderr)
+    for f in [meta_path, STATE / 'proxy' / (name + '.conf'), *(STATE / 'keyproxy-runs').glob(name + '.*.lock'), broker_memory_counter(name)]:
+        if f.exists(): f.unlink()
+    print(f'{name}: {len(containers)} container(s), {len(networks)} network(s), {len(volumes)} volume(s) removed')
+
+# nc delegate broker: `nc-work broker` runs in the foreground in a herdr pane, not as a service. It takes the
+# requests that isolated sessions put in the mailbox of their task, hands them to nc-harness (`nc delegate --broker`, which checks
+# role, model and policy and creates a worker through `create --worker --from-task`) and puts the answer, RESULT.md and the branch
+# as a bundle into the task's read-only inbox. It also applies notes (`nc memory apply --broker`: commit and push on
+# the host, then the view is refreshed) – without a human looking first, with limits instead: each note in the pane, the task in the
+# commit, at most BROKER_MEMORY_PER_DAY new or replaced notes per task and UTC day, only the task's own project file, no deletion.
+# Everything that comes from a container is data: sizes are capped, names are checked,
+# links are not followed, text is cleaned or shown with visible escapes. The requester is always the task that owns the folder,
+# never anything a request says. Nothing is merged, checked out or run.
+BROKER_NAME = re.compile(r'[a-z0-9][a-z0-9-]{0,63}\.json')
+BROKER_ID = re.compile(r'd[0-9]{4}-[0-9]{4}-[0-9a-f]{4}')
+BROKER_REQUEST_MAX, BROKER_BUNDLE_MAX = 64 * 1024, EXPORT_MAX
+BROKER_KEEP, BROKER_PER_ROUND = 8, 4  # files kept in a mailbox, requests read per task and round
+BROKER_ROUND, BROKER_BEAT, BROKER_GAP = 2, 5, 10  # seconds: between rounds, between heartbeats, between two hand-overs of one task
+BROKER_HARNESS_TIMEOUT, BROKER_QUICK_TIMEOUT = 20 * 60, 5 * 60  # one `nc delegate --broker`, every other harness call
+BROKER_POLL, BROKER_LATE_POLL, BROKER_LATE = 10, 5 * 60, 5 * 60  # ask every 10 s; after the deadline plus 5 min: error, then every 5 min
+BROKER_KEEP_ANSWERS, BROKER_KEEP_STORED = 24 * 3600, 3600  # refused/error/cleaned answers, stored answers (memory)
+BROKER_MEMORY_PER_DAY = 20  # new or replaced notes per task and UTC day
+BROKER_OUTCOMES = ('new', 'refreshed', 'replaced', 'unchanged')
+BROKER_COUNTED = {'new', 'replaced'}  # outcomes that count against BROKER_MEMORY_PER_DAY
+BROKER_DROPPED_KEEP, BROKER_DROPPED_MAX, BROKER_DROPPED_READ = 8, 8 * 1024, 32 * 1024  # .dropped: entries, bytes written, bytes read
+BROKER_FULL = 'inbox full (200 answers) – run nc delegate --cleanup <id> for collected runs first'
+BROKER_ANSWERS_PER_MIN, BROKER_MAX_ANSWERS = 4, 200  # answers per requester and minute (refused too); answer folders per inbox
+BROKER_LOG = pathlib.Path('.nc/log/broker.jsonl')  # below the home folder
+
+class BrokerStop(Exception):
+    """The second Ctrl-C: the running harness call was ended, the broker ends too."""
+
+class Broker:
+    """State of one `nc-work broker` run. The clock and the sleep can be replaced in tests."""
+    def __init__(self, clock=time.time, sleep=time.sleep):
+        self.clock, self.sleep = clock, sleep
+        self.seen = set()  # findings already reported in this run
+        self.last_handover = {}  # task -> clock at the end of its last hand-over to the harness
+        self.due = {}  # delegation -> clock when it is asked again
+        self.last_beat = self.last_sweep = None
+        self.interrupted = False  # the first Ctrl-C came while a harness call ran
+        self.answered = {}  # task -> clock of its answers in the last minute
+        # Set by the signal handlers (broker_signals) while a harness call runs; broker_call reads them.
+        self.calling, self.sigints, self.terminated = False, 0, False
+
+def broker_esc(text):
+    """For the pane and the log: control and invisible characters as \\u{…}; names from a container can hold anything."""
+    return ''.join('\\u{%x}' % ord(ch) if ch != ' ' and unicodedata.category(ch)[0] in 'CZ' else ch for ch in str(text))
+
+def broker_clean(text, limit=400):
+    """For a reason that goes to a container: whitespace as one space, control and invisible characters dropped."""
+    text = re.sub(r'\s+', ' ', str(text))
+    return ''.join(ch for ch in text if ch == ' ' or unicodedata.category(ch)[0] not in 'CZ').strip()[:limit]
+
+def broker_iso(ts): return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts))  # always UTC: the container clock is UTC, the host's is not
+
+def broker_epoch(text, fallback):
+    try: moment = datetime.datetime.fromisoformat(str(text))
+    except ValueError: return fallback
+    return (moment if moment.tzinfo else moment.replace(tzinfo=datetime.timezone.utc)).timestamp()
+
+def broker_say(ctx, task_id, kind, result, ident=''):
+    """One line per event: time, task, kind, result, id. No task text – with one exception: a stored note shows its text (from the
+    harness' answer, after its checks, cleaned and cut to 120 characters). The same line as JSON in ~/.nc/log/broker.jsonl."""
+    now = ctx.clock()
+    fields = [broker_esc(x) for x in (task_id, kind, result, ident)]
+    try: print(time.strftime('%H:%M:%S', time.localtime(now)) + ' ' + ' '.join(f for f in fields if f), flush=True)
+    except OSError: pass  # the pane is gone (EIO after it was closed): the log below still gets the line
+    try:
+        log = pathlib.Path.home() / BROKER_LOG
+        log.parent.mkdir(parents=True, exist_ok=True); log.parent.chmod(0o700)
+        fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, (json.dumps({'ts': broker_iso(now), 'task': fields[0], 'kind': fields[1], 'result': fields[2], 'id': fields[3]}) + '\n').encode())
+        finally: os.close(fd)
+    except OSError: pass
+
+def broker_once(ctx, key, *line):
+    """broker_say, but once per run and key."""
+    if key not in ctx.seen:
+        ctx.seen.add(key); broker_say(ctx, *line)
+
+def broker_put(folder, name, write, mode=0o644):
+    """folder/name appears whole or not at all: written as .name.tmp with `mode` whatever the umask (write(fd) fills it), then renamed."""
+    tmp = folder / ('.' + name + '.tmp')
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        os.fchmod(fd, mode); write(fd)
+    except BaseException:
+        os.close(fd); tmp.unlink(missing_ok=True); raise
+    os.close(fd)
+    os.replace(tmp, folder / name)
+
+def broker_write(data):
+    def write(fd):
+        view = memoryview(data)
+        while view: view = view[os.write(fd, view):]
+    return write
+
+def broker_read(path, limit):
+    """At most limit + 1 bytes of a regular file; never through a link, never blocking on a FIFO. None for anything else."""
+    try: fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError: raise
+    except OSError: return None  # a link, or no longer readable
+    try:
+        if not S_ISREG(os.fstat(fd).st_mode): return None
+        data = b''
+        while len(data) <= limit:
+            chunk = os.read(fd, limit + 1 - len(data))
+            if not chunk: break
+            data += chunk
+        return data
+    finally: os.close(fd)
+
+def broker_unlink(path):
+    """True if this call deleted the file, False if it was gone already."""
+    try: os.unlink(path)
+    except FileNotFoundError: return False
+    return True
+
+def broker_tasks():
+    """The tasks the broker looks after: mailbox tasks (broker true, a token) that are ready."""
+    folder = STATE / 'tasks'
+    found = []
+    for f in sorted(folder.glob('*.json')) if folder.is_dir() else []:
+        try: m = json.loads(f.read_text())
+        except (OSError, ValueError): continue
+        if (isinstance(m, dict) and re.fullmatch(r'[a-z][a-z0-9-]{0,39}', f.stem) and m.get('id') == f.stem and m.get('status') == 'ready'
+                and m.get('broker') is True and re.fullmatch(r'[0-9a-f]{32}', str(m.get('broker_token')))): found.append(m)
+    return found
+
+def broker_inbox(m):
+    """The inbox of a task if it and the task folder are real folders; the broker never makes them (nc-work create, start and here do)."""
+    base, _, inbox = broker_paths(m['id'])
+    return None if base.is_symlink() or not base.is_dir() or inbox.is_symlink() or not inbox.is_dir() else inbox
+
+def broker_beat(ctx, force=False):
+    """The sign of life in every inbox: .broker with the UTC time, replaced atomically at least every BROKER_BEAT seconds."""
+    now = ctx.clock()
+    if not force and ctx.last_beat is not None and now - ctx.last_beat < BROKER_BEAT: return
+    ctx.last_beat = now
+    data = json.dumps({'v': 1, 'ts': broker_iso(now)}, separators=(',', ':')).encode()
+    for m in broker_tasks():
+        if (inbox := broker_inbox(m)):
+            try: broker_put(inbox, '.broker', broker_write(data))
+            except OSError: pass
+
+def broker_dropped(inbox, stems, reason):
+    """Note in <inbox>/.dropped that request(s) `stems` were deleted without an answer, so the client stops at once instead of waiting
+    for its deadline: {"v":1,"entries":[{"request","reason","ts"}]}, the newest first, at most BROKER_DROPPED_KEEP entries and
+    BROKER_DROPPED_MAX bytes (the oldest go first), 0644, replaced atomically. The container cannot write it (the inbox is mounted
+    read-only); it never counts as an answer and is never swept. A broken, linked or too large file starts an empty list (a link is
+    replaced, never followed). OSError is swallowed: without the entry the client waits for its deadline, as before."""
+    try:
+        try: raw = broker_read(inbox / '.dropped', BROKER_DROPPED_READ)
+        except FileNotFoundError: raw = None
+        entries = []
+        if raw is not None and len(raw) <= BROKER_DROPPED_READ:
+            try: doc = json.loads(raw.decode('utf-8'))
+            except (UnicodeDecodeError, ValueError, RecursionError): doc = None
+            if isinstance(doc, dict) and doc.get('v') == 1 and isinstance(doc.get('entries'), list):
+                entries = [e for e in doc['entries'] if isinstance(e, dict) and all(isinstance(e.get(k), str) for k in ('request', 'reason', 'ts'))]
+        ts, why = broker_iso(time.time()), broker_clean(reason, 200)
+        for stem in ([stems] if isinstance(stems, str) else stems):
+            entries = [{'request': stem, 'reason': why, 'ts': ts}] + [e for e in entries if e['request'] != stem]
+        entries = entries[:BROKER_DROPPED_KEEP]
+        while True:
+            data = json.dumps({'v': 1, 'entries': entries}, ensure_ascii=False).encode('utf-8')
+            if len(data) <= BROKER_DROPPED_MAX or not entries: break
+            entries.pop()
+        broker_put(inbox, '.dropped', broker_write(data))
+    except OSError: pass
+
+def broker_folder(inbox, stem):
+    """inbox/<stem>, made 0755 if it is not there; a link or a file in its place is an error."""
+    folder = inbox / stem
+    if folder.is_symlink() or (folder.exists() and not folder.is_dir()): raise OSError(f'{folder} is a link or not a folder')
+    folder.mkdir(mode=0o755, exist_ok=True); folder.chmod(0o755)
+    return folder
+
+def broker_respond(inbox, stem, state, **fields):
+    """response.json of request `stem`, replaced atomically; the files of a result are in place before it says done."""
+    data = {'v': 1, 'request': stem, 'state': state, 'reason': None, 'task_id': None, 'timeout_min': None, 'started': None, 'result': None}
+    data.update(fields)
+    broker_put(broker_folder(inbox, stem), 'response.json', broker_write(json.dumps(data).encode()))
+
+def broker_response(folder):
+    """response.json of an answer folder as a dict, or None."""
+    try: data = broker_read(folder / 'response.json', BROKER_REQUEST_MAX)
+    except OSError: return None
+    try: obj = json.loads(data.decode('utf-8')) if data is not None and len(data) <= BROKER_REQUEST_MAX else None
+    except (ValueError, RecursionError): return None
+    return obj if isinstance(obj, dict) else None
+
+def broker_runs():
+    """The running delegations: STATE/broker-runs/<id>.json (task, token, request, deadline), the broker's own state."""
+    folder, found = STATE / 'broker-runs', []
+    for f in sorted(folder.glob('d*.json')) if folder.is_dir() else []:
+        try: run = json.loads(f.read_text())
+        except (OSError, ValueError): continue
+        if (isinstance(run, dict) and BROKER_ID.fullmatch(f.stem) and run.get('id') == f.stem and isinstance(run.get('requester'), str)
+                and isinstance(run.get('token'), str) and BROKER_NAME.fullmatch(str(run.get('request')) + '.json')
+                and isinstance(run.get('deadline'), (int, float))): found.append(run)
+    return found
+
+def broker_run_save(run):
+    folder = STATE / 'broker-runs'
+    folder.mkdir(parents=True, exist_ok=True); folder.chmod(0o700)
+    broker_put(folder, run['id'] + '.json', broker_write(json.dumps(run, indent=2).encode() + b'\n'), 0o600)
+
+def broker_run_drop(ctx, task_id):
+    broker_unlink(STATE / 'broker-runs' / (task_id + '.json')); ctx.due.pop(task_id, None)
+
+def broker_reason(err, code):
+    """The last line of a harness call's stderr without its `nc delegate: ` or `nc memory: ` prefix, cleaned."""
+    lines = [l.strip() for l in err.decode(errors='replace').splitlines() if l.strip()]
+    return broker_clean(re.sub(r'^nc (delegate|memory): ', '', lines[-1])) if lines else f'Exit {code}'
+
+def broker_one_line(out):
+    """The one JSON object a harness call prints on stdout, else None."""
+    try: lines = [l for l in out.decode('utf-8').splitlines() if l.strip()]
+    except UnicodeDecodeError: return None
+    if len(lines) != 1: return None
+    try: obj = json.loads(lines[0])
+    except (ValueError, RecursionError): return None
+    return obj if isinstance(obj, dict) else None
+
+def broker_signalled(ctx):
+    """What the signals that came during a harness call mean: 'signal' after SIGTERM/SIGHUP, 'interrupt' at the second Ctrl-C,
+    else None (the first Ctrl-C only says that the call is waited for)."""
+    if ctx.terminated: return 'signal'
+    while ctx.sigints:
+        ctx.sigints -= 1
+        if ctx.interrupted: return 'interrupt'
+        ctx.interrupted = True
+        try: print('\nCtrl-C: waiting for the running call, then the broker ends. Press Ctrl-C again to abort it.', file=sys.stderr, flush=True)
+        except OSError: pass
+    return None
+
+def broker_ending(ctx):
+    """Between two calls: the signals that came during the last one count now, also when its process ended normally in the same
+    second. True after SIGTERM/SIGHUP or a Ctrl-C (the first one sets `interrupted`): nothing new starts, the broker ends."""
+    broker_signalled(ctx)
+    return ctx.terminated or ctx.interrupted
+
+def broker_call(ctx, args, timeout):
+    """bin/nc ARGS (nc delegate …, nc memory apply --broker …) from the harness checkout on the host (cwd /, its own process group,
+    so a Ctrl-C in the pane does not reach it).
+    The heartbeat goes on while it runs. The first Ctrl-C says the call is waited for (and the broker ends after it); the timeout,
+    the second Ctrl-C or SIGTERM/SIGHUP (the pane was closed) end the whole group. Returns (code, stdout, stderr, why) with why None,
+    'timeout', 'interrupt' or 'signal'. While it runs the handlers of broker_signals only set flags, so nothing raises in the wait or
+    the kill loop; a KeyboardInterrupt from elsewhere (no handler installed) counts as a Ctrl-C."""
+    ctx.calling = True
+    try:
+        proc = subprocess.Popen([str(HARNESS / 'bin/nc'), *args], cwd='/', stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        deadline, why = ctx.clock() + timeout, None
+        while why is None:
+            try:
+                why = broker_signalled(ctx)
+                if why: break
+                broker_beat(ctx)
+                out, err = proc.communicate(timeout=1)
+                return proc.returncode, out, err, None
+            except subprocess.TimeoutExpired:
+                if ctx.clock() >= deadline: why = 'timeout'
+            except KeyboardInterrupt: ctx.sigints += 1
+        out = err = b''
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                try: os.killpg(proc.pid, sig)
+                except ProcessLookupError: pass
+                out, err = proc.communicate(timeout=10)
+                break
+            except (subprocess.TimeoutExpired, KeyboardInterrupt): continue  # a further Ctrl-C: on to SIGKILL
+        return None, out, err, why
+    finally: ctx.calling = False
+
+def broker_signals(ctx):
+    """SIGINT, SIGTERM and SIGHUP (the pane was closed). During a harness call they only set flags (broker_call ends the call's
+    process group on SIGTERM/SIGHUP, as on the second Ctrl-C); otherwise they end the broker at once. Returns the old handlers."""
+    def on_int(signum, frame):
+        if not ctx.calling: raise KeyboardInterrupt
+        ctx.sigints += 1
+    def on_term(signum, frame):
+        if not ctx.calling: raise KeyboardInterrupt
+        ctx.terminated = True
+    return {sig: signal.signal(sig, handler) for sig, handler in ((signal.SIGINT, on_int), (signal.SIGTERM, on_term), (signal.SIGHUP, on_term))}
+
+BROKER_HALF = 'A half-created worker may be left over: nc-work list, then nc-work remove <task> --force'
+def broker_killed(why, timeout):
+    """Why a harness call was ended, naming the limit that ran out, and what may be left over."""
+    return {'timeout': f'timeout ({timeout // 60} minutes) in the harness call',
+            'interrupt': 'harness call aborted (Ctrl-C in the broker)',
+            'signal': 'harness call aborted (broker stopped)'}[why] + '. ' + BROKER_HALF
+
+def broker_requester(ctx, m):
+    """One round for one task: what is in its mailbox."""
+    rid = m['id']
+    _, requests, _ = broker_paths(rid)
+    inbox = broker_inbox(m)
+    if inbox is None or requests.is_symlink() or not requests.is_dir():
+        broker_once(ctx, ('skip', rid), rid, 'mailbox', 'skipped: folders missing or links (nc-work start)'); return
+    with os.scandir(requests) as found:  # folders and dot entries are not requests; the client writes .name.tmp before it renames
+        entries = [(e.name, e.is_dir(follow_symlinks=False)) for e in found if not e.name.startswith('.')]
+    for name, folder in entries:
+        if folder: broker_once(ctx, ('folder', rid, name), rid, 'mailbox', 'folder, left alone', name)
+    names = sorted(name for name, folder in entries if not folder)
+    full = bool(names) and broker_answer_count(inbox) >= BROKER_MAX_ANSWERS  # only cleanup and memory requests go on (broker_handle)
+    if len(names) > BROKER_KEEP:
+        for name in names[BROKER_KEEP:]: broker_unlink(requests / name)
+        broker_say(ctx, rid, 'mailbox', f'{len(names) - BROKER_KEEP} file(s) over {BROKER_KEEP} deleted without an answer')
+        if (cut := [n[:-5] for n in names[BROKER_KEEP:] if BROKER_NAME.fullmatch(n)]):  # one write per round, the newest first
+            broker_dropped(inbox, cut, f'mailbox full (more than {BROKER_KEEP} requests)')
+        names = names[:BROKER_KEEP]
+    handled = 0
+    for name in names:
+        path = requests / name
+        try: regular = S_ISREG(os.lstat(path).st_mode)
+        except FileNotFoundError: continue
+        if not BROKER_NAME.fullmatch(name) or not regular:  # wrong names, links, FIFOs, devices: deleted without following
+            broker_unlink(path)
+            broker_once(ctx, ('junk', rid, name), rid, 'mailbox', 'deleted (wrong name)' if not BROKER_NAME.fullmatch(name) else 'deleted (link or special file)', name)
+            continue
+        last = ctx.last_handover.get(rid)
+        if broker_ending(ctx): return  # a signal or the first Ctrl-C: nothing new is handed over
+        if handled >= BROKER_PER_ROUND or (last is not None and ctx.clock() - last < BROKER_GAP): continue  # stays until a later round
+        recent = ctx.answered[rid] = [t for t in ctx.answered.get(rid, []) if ctx.clock() - t < 60]
+        if len(recent) >= BROKER_ANSWERS_PER_MIN: continue  # every answer counts, refused ones too; the rest waits
+        handled += 1
+        broker_handle(ctx, m, inbox, requests, name, full)
+
+def broker_answer_count(inbox):
+    """Answer folders that count against BROKER_MAX_ANSWERS. cleaned answers do not: each one took exactly one answer of its
+    delegation with it (or followed a run of this task's), and the sweep removes it after 24 hours. So a cleanup makes room.
+    stored answers (memory) do not either: the sweep removes them after an hour."""
+    with os.scandir(inbox) as found:
+        folders = [pathlib.Path(e.path) for e in found if not e.name.startswith('.') and e.is_dir(follow_symlinks=False)]
+    return sum(1 for f in folders if ((broker_response(f) or {}).get('state') not in ('cleaned', 'stored')))
+
+def broker_handle(ctx, m, inbox, requests, name, full=False):
+    """One request: read, stage, take out of the mailbox, hand over, answer, delete the staged copy. The switch is broker_type, by the
+    content, never the name: cleanup to broker_cleanup, memory to broker_memory, everything else (also what is not JSON) to
+    broker_delegate, where the harness judges it. With a full inbox only a valid cleanup request for a delegation of this task and a
+    memory request go on; any other is deleted and gets an entry in .dropped instead of an answer."""
+    rid, stem, path = m['id'], name[:-5], requests / name
+    staging = STATE / 'broker-runs' / 'staging' / rid
+    staged = staging / name
+    if os.path.lexists(inbox / stem) or os.path.lexists(staged):  # an answer is never overwritten
+        broker_unlink(path); broker_say(ctx, rid, 'request', 'duplicate, deleted (no answer)', stem); return
+    try: data = broker_read(path, BROKER_REQUEST_MAX)
+    except FileNotFoundError: return
+    if data is None:
+        broker_unlink(path); broker_say(ctx, rid, 'mailbox', 'deleted (link or special file)', name); return
+    kind, task_id = broker_type(data) if len(data) <= BROKER_REQUEST_MAX else ('delegate', None)
+    if full and not (kind == 'memory' or (kind == 'cleanup' and task_id and broker_owns(m, inbox, task_id))):
+        # a delegate request, a malformed cleanup or one for a delegation that is not this task's: no answer folder, an entry in .dropped
+        broker_unlink(path); broker_dropped(inbox, stem, BROKER_FULL)
+        broker_say(ctx, rid, 'request', f'deleted without an answer (inbox full: {BROKER_MAX_ANSWERS} answers; cleanup makes room)', stem); return
+    ctx.answered.setdefault(rid, []).append(ctx.clock())  # from here on the request gets an answer
+    if len(data) > BROKER_REQUEST_MAX:
+        broker_unlink(path)
+        broker_respond(inbox, stem, 'refused', reason=f'request larger than {BROKER_REQUEST_MAX // 1024} KiB')
+        broker_say(ctx, rid, 'request', 'refused (too large)', stem); return
+    if staging.is_symlink(): raise OSError(f'{staging} is a link')
+    staging.mkdir(parents=True, exist_ok=True); staging.chmod(0o700); staging.parent.chmod(0o700)
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try: broker_write(data)(fd)
+    finally: os.close(fd)
+    deleted = broker_unlink(path)  # missing already (ENOENT) is no error for delegate and cleanup: answered all the same
+    if kind == 'memory' and not deleted:
+        # The client took it back between reading and deleting and writes the note into its outbox: applying it here as well would
+        # apply it twice. Only a memory request the broker deleted itself goes to the harness.
+        broker_unlink(staged); ctx.answered[rid].pop()
+        broker_say(ctx, rid, 'memory', 'taken back by the task', stem); return
+    # The staged copy goes only after an answer is written (BrokerStop comes after the error answer). If anything else ends
+    # the broker on the way, the copy stays and broker_start answers it after a restart.
+    try:
+        if kind == 'cleanup': broker_cleanup(ctx, m, inbox, stem, task_id, full)
+        elif kind == 'memory': broker_memory(ctx, m, inbox, stem, staged, full)
+        else: broker_delegate(ctx, m, inbox, stem, staged)
+    except BrokerStop:
+        broker_unlink(staged); raise
+    broker_unlink(staged)
+
+def broker_cleanup_id(data):
+    """None if the request is not a cleanup request (the harness judges everything else, invalid JSON included); else the task id,
+    or '' when it is malformed: UTF-8, one object with exactly v (the number 1), type and task_id, an id of the usual form."""
+    try: obj = json.loads(data.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError, RecursionError): return None
+    if type(obj) is not dict or obj.get('type') != 'cleanup': return None
+    ok = (set(obj) == {'v', 'type', 'task_id'} and type(obj['v']) is int and obj['v'] == 1
+          and type(obj['task_id']) is str and BROKER_ID.fullmatch(obj['task_id']))
+    return obj['task_id'] if ok else ''
+
+def broker_type(data):
+    """The switch of broker_handle, by the content only (never the name's first letter): ('cleanup', id or '') for a cleanup request,
+    ('memory', None) for UTF-8 JSON, one object with type "memory" (the harness checks the rest), else ('delegate', None)."""
+    if (task_id := broker_cleanup_id(data)) is not None: return 'cleanup', task_id
+    try: obj = json.loads(data.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError, RecursionError): return 'delegate', None
+    return ('memory', None) if type(obj) is dict and obj.get('type') == 'memory' else ('delegate', None)
+
+def broker_delegate(ctx, m, inbox, stem, staged):
+    """Hand a request to `nc delegate --broker`. Requester, token, project and path come from the task's record, never from the request."""
+    rid = m['id']
+    path = m.get('project_path') or profile(m['project'])['path']
+    try:
+        code, out, err, why = broker_call(ctx, ['delegate', '--broker', '--requester', rid, '--token', m['broker_token'], '--profile', m['project'],
+                                                '--project-path', path, '--request', str(staged), '--request-name', stem + '.json'], BROKER_HARNESS_TIMEOUT)
+    finally: ctx.last_handover[rid] = ctx.clock()
+    answer = broker_one_line(out) if why is None else None
+    state = answer.get('state') if answer else None
+    reason = answer.get('reason') if answer else None
+    if why:
+        broker_respond(inbox, stem, 'error', reason=broker_killed(why, BROKER_HARNESS_TIMEOUT)); broker_say(ctx, rid, 'delegate', 'error (' + why + ')', stem)
+        if why != 'timeout': raise BrokerStop()
+    elif state == 'started' and code == 0 and (tid := answer.get('task_id')) and isinstance(tid, str) and BROKER_ID.fullmatch(tid) \
+            and type(answer.get('timeout_min')) is int and 1 <= answer['timeout_min'] <= 20 \
+            and isinstance(answer.get('started'), str) and answer['started'] == broker_clean(answer['started'], 40):
+        now = ctx.clock()
+        run = {'id': tid, 'requester': rid, 'token': m['broker_token'], 'request': stem, 'timeout_min': answer['timeout_min'],
+               'started': answer['started'], 'deadline': broker_epoch(answer['started'], now) + answer['timeout_min'] * 60, 'errored': False}
+        broker_run_save(run)  # before the answer: a restart still follows the worker
+        broker_respond(inbox, stem, 'started', task_id=tid, timeout_min=run['timeout_min'], started=run['started'])
+        ctx.due[tid] = now + BROKER_POLL
+        broker_say(ctx, rid, 'delegate', 'started', tid)
+    elif state in ('refused', 'error') and code == {'refused': 1, 'error': 2}[state] and isinstance(reason, str):
+        broker_respond(inbox, stem, state, reason=broker_clean(reason) or state)
+        broker_say(ctx, rid, 'delegate', 'refused' if state == 'refused' else 'error', stem)
+    else:
+        broker_respond(inbox, stem, 'error', reason=f'the harness gave no usable answer (exit {code})')
+        broker_say(ctx, rid, 'delegate', f'error (unusable output, exit {code})', stem)
+        if (line := broker_reason(err, code)): broker_say(ctx, rid, 'delegate', 'stderr: ' + line, stem)
+
+def broker_owns(m, inbox, task_id):
+    """Whether delegation task_id belongs to this task: a response.json with that task_id in ITS inbox, or a run with its token.
+    The request alone never decides."""
+    if any(r['id'] == task_id and r['token'] == m['broker_token'] and r['requester'] == m['id'] for r in broker_runs()): return True
+    with os.scandir(inbox) as found:
+        return any((a := broker_response(pathlib.Path(e.path))) and a.get('task_id') == task_id
+                   for e in found if not e.name.startswith('.') and e.is_dir(follow_symlinks=False))
+
+def broker_cleanup(ctx, m, inbox, stem, task_id, full=False):
+    """`nc delegate --cleanup <id>` for a delegation of this task; the answer folder of that delegation goes with it. With a full inbox
+    anything but cleaned (refused, error, timeout) goes into .dropped instead of an answer folder."""
+    rid = m['id']
+    def reply(state, text, **fields):
+        if full and state != 'cleaned': broker_dropped(inbox, stem, fields.get('reason') or state)
+        else: broker_respond(inbox, stem, state, **fields)
+        broker_say(ctx, rid, 'cleanup', text, task_id or stem)
+    if not task_id: return reply('refused', 'refused (invalid)', reason='request invalid')
+    if not broker_owns(m, inbox, task_id): return reply('refused', 'refused (foreign id)', reason='the delegation does not belong to this task')
+    def cleaned(**extra):
+        for e in list(os.scandir(inbox)):  # a list: the folders are deleted below
+            a = broker_response(pathlib.Path(e.path)) if not e.name.startswith('.') and e.is_dir(follow_symlinks=False) else None
+            if a and a.get('task_id') == task_id: shutil.rmtree(e.path)
+        broker_run_drop(ctx, task_id)
+        reply('cleaned', 'cleaned up' + (' (was gone already)' if extra else ''), task_id=task_id, **extra)
+    # Neither run folder nor worker task: there is nothing the harness could clean up, and it would only refuse.
+    if not os.path.lexists(pathlib.Path.home() / '.nc/delegate' / task_id) and not os.path.lexists(STATE / 'tasks' / (task_id + '.json')):
+        return cleaned(gone=True)
+    code, out, err, why = broker_call(ctx, ['delegate', '--cleanup', task_id], BROKER_QUICK_TIMEOUT)
+    if why:
+        reply('error', 'error (' + why + ')', reason=broker_killed(why, BROKER_QUICK_TIMEOUT).split('. ')[0], task_id=task_id)
+        if why != 'timeout': raise BrokerStop()
+    elif code == 0: cleaned()
+    else: reply('refused' if code == 1 else 'error', 'refused' if code == 1 else 'error', reason=broker_reason(err, code) or 'error', task_id=task_id)
+
+def broker_memory_counter(name):
+    """The broker's own count of a task's notes per UTC day (only the broker keeps it, not the harness, not broker.jsonl)."""
+    return STATE / 'broker-runs' / 'memory' / (valid(name) + '.json')
+
+def broker_memory_count(m, day):
+    """New or replaced notes of task m on `day`: 0 for another token (a new task with an old name), another day, a missing or broken file."""
+    try: raw = broker_read(broker_memory_counter(m['id']), 4096)
+    except OSError: return 0
+    try: obj = json.loads(raw.decode('utf-8')) if raw is not None and len(raw) <= 4096 else None
+    except (UnicodeDecodeError, ValueError, RecursionError): return 0
+    ok = isinstance(obj, dict) and obj.get('token') == m['broker_token'] and obj.get('day') == day and type(obj.get('count')) is int and obj['count'] >= 0
+    return obj['count'] if ok else 0
+
+def broker_memory_save(m, day, count):
+    folder = broker_memory_counter(m['id']).parent
+    folder.mkdir(parents=True, exist_ok=True); folder.chmod(0o700); folder.parent.chmod(0o700)
+    broker_put(folder, m['id'] + '.json', broker_write(json.dumps({'token': m['broker_token'], 'day': day, 'count': count}).encode()), 0o600)
+
+def broker_memory(ctx, m, inbox, stem, staged, full=False):
+    """`nc memory apply --broker` for a note of this task. Project and requester come from the task's record, never from the request;
+    the harness checks the request, applies it to that project's file only (no deletion), commits naming the task and pushes. Before
+    the answer the view is refreshed, so `nc memory search` finds the note as soon as the client sees stored. The note's text is shown
+    only now, from the harness' answer after its checks. With a full inbox refused and error go into .dropped (stored gets its folder,
+    which does not count). No last_handover: the 10 s gap is a rule for delegate; the 4 answers per minute hold."""
+    rid = m['id']
+    def reply(state, text, **fields):
+        if full and state != 'stored': broker_dropped(inbox, stem, fields.get('reason') or state)
+        else: broker_respond(inbox, stem, state, **fields)
+        broker_say(ctx, rid, 'memory', text, stem)
+    if m.get('worker'): return reply('refused', 'refused (worker)', reason=f'{rid}: worker task without memory (nc delegate)')
+    if not m.get('memory'): return reply('refused', 'refused (no memory)', reason=f'{rid}: task without memory (created by an older nc-work)')
+    day = time.strftime('%Y-%m-%d', time.gmtime(ctx.clock()))  # the UTC day of the broker's clock (the note's date is the host's local day)
+    count = broker_memory_count(m, day)
+    if count >= BROKER_MEMORY_PER_DAY:
+        return reply('refused', f'refused ({BROKER_MEMORY_PER_DAY} a day)', reason=f'at most {BROKER_MEMORY_PER_DAY} new or replaced notes per task and day')
+    code, out, err, why = broker_call(ctx, ['memory', 'apply', '--broker', '--project', valid(m['project']), '--request', str(staged), '--requester', rid],
+                                      BROKER_QUICK_TIMEOUT)
+    if why:  # no BROKER_HALF: there is no half worker; the note may be committed all the same
+        reply('error', 'error (' + why + ')', reason=broker_killed(why, BROKER_QUICK_TIMEOUT).split('. ')[0]
+              + ' – maybe stored anyway: nc memory search, then submit again')
+        if why != 'timeout': raise BrokerStop()
+        return
+    answer = broker_one_line(out)
+    state = answer.get('state') if answer else None
+    if (state == 'stored' and code == 0 and answer.get('outcome') in BROKER_OUTCOMES and type(answer.get('pushed')) is bool
+            and isinstance(answer.get('note'), str)):
+        # The note is in the memory now: a host fault from here on must not end without an answer (the staged copy would stay, the
+        # client would wait for its deadline, and broker_start would wrongly say "submit the note again" after a restart). broker_handle
+        # deletes the staged copy once this returns.
+        outcome, pushed = answer['outcome'], answer['pushed']
+        if outcome in BROKER_COUNTED:
+            try: broker_memory_save(m, day, count + 1)
+            except OSError as exc: broker_say(ctx, rid, 'memory', f'counter not saved: {exc}', stem)
+        try: memory_view(rid, m['project'])
+        except OSError as exc: broker_say(ctx, rid, 'memory', f'view not refreshed: {exc}', stem)
+        try: broker_respond(inbox, stem, 'stored', result={'outcome': outcome, 'pushed': pushed})
+        except OSError as exc:
+            broker_dropped(inbox, stem, 'stored, answer not written – the note is in the memory')
+            broker_say(ctx, rid, 'memory', f'answer not written: {exc}', stem)
+        broker_say(ctx, rid, 'memory', f'stored ({outcome}{", not pushed" if not pushed else ""}): ' + broker_clean(answer['note'], 120), stem)
+    elif state in ('refused', 'error') and code == {'refused': 1, 'error': 2}[state] and isinstance(answer.get('reason'), str):
+        reply(state, 'refused' if state == 'refused' else 'error', reason=broker_clean(answer['reason']) or state)
+    else:
+        reply('error', f'error (unusable output, exit {code})', reason=f'the harness gave no usable answer (exit {code})')
+        if (line := broker_reason(err, code)): broker_say(ctx, rid, 'memory', 'stderr: ' + line, stem)
+
+def broker_round(ctx):
+    """One pass over the mailboxes of all ready mailbox tasks. A fault with one task does not stop the round."""
+    broker_beat(ctx)
+    for m in broker_tasks():
+        try: broker_requester(ctx, m)
+        except BrokerStop: raise
+        except Exception as exc: broker_say(ctx, m['id'], 'error', f'{type(exc).__name__}: {exc}')
+
+def broker_poll(ctx):
+    """Ask the running delegations (every 10 s each; every 5 min once an error is written) and deliver what is finished."""
+    for run in broker_runs():
+        if broker_ending(ctx): return
+        if ctx.due.get(run['id'], 0) > ctx.clock(): continue
+        ctx.due[run['id']] = ctx.clock() + (BROKER_LATE_POLL if run.get('errored') else BROKER_POLL)
+        try:
+            broker_poll_one(ctx, run)
+            if run.get('errored'): ctx.due[run['id']] = ctx.clock() + BROKER_LATE_POLL  # set by this very call
+        except BrokerStop: raise
+        except Exception as exc: broker_say(ctx, run['requester'], 'error', f'{type(exc).__name__}: {exc}', run['id'])
+
+def broker_task_of(run):
+    """The task a run belongs to if it is still the same one (record there, same token) and has an inbox; else (None, None)."""
+    for m in broker_tasks():
+        if m['id'] == run['requester'] and m['broker_token'] == run['token']: return m, broker_inbox(m)
+    return None, None
+
+def broker_poll_one(ctx, run):
+    """`nc delegate --result <id>` with the same limit as --broker: fetching can take long (lock, export, stop, bundle). A signal
+    ends the call and the broker without an answer; the run stays in broker-runs and is asked again after a restart."""
+    tid = run['id']
+    code, out, err, why = broker_call(ctx, ['delegate', '--result', tid], BROKER_HARNESS_TIMEOUT)
+    if why in ('interrupt', 'signal'): raise BrokerStop()
+    answer = broker_one_line(out) if code == 0 else None
+    if answer is not None and isinstance(answer.get('status'), str):
+        if answer['status'] != 'running': broker_deliver(ctx, run, answer)
+        return
+    if not os.path.lexists(STATE / 'tasks' / (tid + '.json')):  # the worker task is gone (nc-work remove): nothing will come
+        broker_say(ctx, run['requester'], 'delegate', 'worker task is gone – no longer followed', tid)
+        broker_run_drop(ctx, tid); return
+    reason = broker_reason(err, code) if code is not None else f'timeout ({BROKER_HARNESS_TIMEOUT // 60} minutes) while asking'
+    broker_once(ctx, ('result', tid), run['requester'], 'delegate', 'result not available: ' + reason, tid)
+    if ctx.clock() > run['deadline'] + BROKER_LATE and not run.get('errored'):
+        # The requester is checked only in broker_deliver; asking goes on every five minutes either way.
+        m, inbox = broker_task_of(run)
+        if inbox is not None:
+            broker_respond(inbox, run['request'], 'error', reason=reason, task_id=tid, timeout_min=run.get('timeout_min'), started=run.get('started'))
+        run['errored'] = True; broker_run_save(run)
+        broker_say(ctx, run['requester'], 'delegate', 'error (deadline passed)', tid)
+
+def broker_copy(src, folder, name, limit, truncate):
+    """A real file of the harness' delivery folder into the answer folder (0644): never through a link, at most limit bytes.
+    False if there is no such file; ValueError for more than limit unless truncate."""
+    try: fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError: return False
+    try:
+        if not S_ISREG(os.fstat(fd).st_mode): return False
+        def write(out):
+            size = 0
+            while chunk := os.read(fd, 1 << 16):
+                if size + len(chunk) > limit:
+                    if not truncate: raise ValueError(f'{name} is larger than {limit // 2**20} MiB')
+                    chunk = chunk[:limit - size]
+                broker_write(chunk)(out); size += len(chunk)
+                if size >= limit: break
+        broker_put(folder, name, write)
+        return True
+    finally: os.close(fd)
+
+def broker_deliver(ctx, run, answer):
+    """A delegation has ended. The task must still be the one that asked (record there, same token) – checked only now, so that the
+    worker was stopped at its deadline all the same. Then result.bundle and RESULT.md go into the answer folder and response.json says done."""
+    tid, rid = run['id'], run['requester']
+    m, inbox = broker_task_of(run)
+    if inbox is None:
+        broker_say(ctx, rid, 'delegate', f'requesting task gone or replaced – the result is in ~/.nc/delegate/{tid}', tid)
+        broker_run_drop(ctx, tid); return
+    delivery = pathlib.Path.home() / '.nc/delegate' / tid / 'delivery'
+    folder = broker_folder(inbox, run['request'])
+    keep = {'task_id': tid, 'timeout_min': run.get('timeout_min'), 'started': run.get('started')}
+    try:
+        broker_copy(delivery / 'result.bundle', folder, 'result.bundle', BROKER_BUNDLE_MAX, False)
+        broker_copy(delivery / 'RESULT.md', folder, 'RESULT.md', RESULT_MAX, True)
+    except ValueError as exc:
+        broker_respond(inbox, run['request'], 'error', reason=broker_clean(exc), **keep)
+        broker_say(ctx, rid, 'delegate', 'error (result too large)', tid); broker_run_drop(ctx, tid); return
+    try: raw = broker_read(delivery / 'result.json', BROKER_REQUEST_MAX)
+    except OSError: raw = None
+    try: result = json.loads(raw.decode('utf-8')) if raw is not None and len(raw) <= BROKER_REQUEST_MAX else None
+    except (ValueError, RecursionError): result = None
+    broker_respond(inbox, run['request'], 'done', result=result if isinstance(result, dict) else answer, **keep)
+    broker_run_drop(ctx, tid)
+    broker_say(ctx, rid, 'delegate', 'done: ' + broker_esc(str(answer.get('status'))[:40]), tid)
+
+def broker_sweep(ctx):
+    """Once a minute: answer folders with refused, error (no delegation running for it) or cleaned go after 24 hours, stored after an hour."""
+    now = ctx.clock()
+    if ctx.last_sweep is not None and now - ctx.last_sweep < 60: return
+    ctx.last_sweep = now
+    running = {(r['requester'], r['request']) for r in broker_runs()}
+    for m in broker_tasks():
+        if (inbox := broker_inbox(m)) is None: continue
+        for e in list(os.scandir(inbox)):
+            if e.name.startswith('.') or not e.is_dir(follow_symlinks=False): continue
+            answer = broker_response(pathlib.Path(e.path))
+            if not answer or answer.get('state') not in ('refused', 'error', 'cleaned', 'stored') or (m['id'], e.name) in running: continue
+            tid = answer.get('task_id')
+            if answer['state'] == 'error' and isinstance(tid, str) and BROKER_ID.fullmatch(tid) and os.path.lexists(pathlib.Path.home() / '.nc/delegate' / tid):
+                continue  # a run that can still be fetched or cleaned up keeps its answer
+            keep = BROKER_KEEP_STORED if answer['state'] == 'stored' else BROKER_KEEP_ANSWERS
+            try: old = now - os.stat(pathlib.Path(e.path) / 'response.json').st_mtime > keep
+            except OSError: continue
+            if old:
+                shutil.rmtree(e.path, ignore_errors=True)
+                broker_say(ctx, m['id'], 'inbox', 'cleaned up (1 hour)' if answer['state'] == 'stored' else 'cleaned up (24 hours)', e.name)
+
+def broker_adopt(m, name):
+    """A run of the harness for request `name` of task m that the broker never recorded (it was ended between create and its own
+    record): ~/.nc/delegate/<id>/request.json with origin broker, the same requester, token and request name, and no result.json."""
+    for folder in sorted((pathlib.Path.home() / '.nc/delegate').glob('d*')):
+        if not BROKER_ID.fullmatch(folder.name) or folder.is_symlink() or os.path.lexists(folder / 'result.json'): continue
+        try: req = json.loads((broker_read(folder / 'request.json', BROKER_REQUEST_MAX) or b'').decode('utf-8'))
+        except (OSError, ValueError, RecursionError): continue
+        if (isinstance(req, dict) and req.get('task_id') == folder.name and req.get('origin') == 'broker' and req.get('requester') == m['id']
+                and req.get('requester_token') == m['broker_token'] and req.get('request_name') == name
+                and type(req.get('timeout_min')) is int and 1 <= req['timeout_min'] <= 20 and isinstance(req.get('started'), str)):
+            return req
+    return None
+
+def broker_start(ctx):
+    """After a restart, for every staged request (it was handed over, or about to be, and is never run again), if its task still
+    has an inbox and no answer folder for it: started from broker-runs if the run was recorded; started for a run the harness made
+    but the broker did not record (taken over into broker-runs); otherwise error. A memory request is never taken over as a run: error,
+    "submit the note again" (a note stored already comes back as refreshed or unchanged), the daily count unchanged. Then the staged
+    copy goes."""
+    staging = STATE / 'broker-runs' / 'staging'
+    if not staging.is_dir() or staging.is_symlink(): return
+    tasks = {m['id']: m for m in broker_tasks()}
+    runs = broker_runs()
+    for folder in sorted(staging.iterdir()):
+        if folder.is_symlink() or not folder.is_dir(): continue
+        m = tasks.get(folder.name)
+        inbox = broker_inbox(m) if m else None
+        for f in sorted(folder.iterdir()):
+            if f.is_symlink() or not f.is_file(): continue
+            stem = f.name[:-5]
+            if inbox and BROKER_NAME.fullmatch(f.name) and not os.path.lexists(inbox / stem):
+                try:
+                    try: kind = broker_type(broker_read(f, BROKER_REQUEST_MAX) or b'')[0]
+                    except OSError: kind = 'delegate'
+                    if kind == 'memory':
+                        broker_respond(inbox, stem, 'error', reason='broker stopped during hand-over – submit the note again')
+                        broker_say(ctx, folder.name, 'memory', 'error (broker was stopped)', stem)
+                        f.unlink(); continue
+                    run = next((r for r in runs if r['requester'] == m['id'] and r['token'] == m['broker_token'] and r['request'] == stem), None)
+                    if run is None and (req := broker_adopt(m, f.name)):
+                        run = {'id': req['task_id'], 'requester': m['id'], 'token': m['broker_token'], 'request': stem, 'timeout_min': req['timeout_min'],
+                               'started': req['started'], 'deadline': broker_epoch(req['started'], ctx.clock()) + req['timeout_min'] * 60, 'errored': False}
+                        broker_run_save(run); broker_say(ctx, m['id'], 'delegate', 'run taken over', run['id'])
+                    if run:
+                        broker_respond(inbox, stem, 'started', task_id=run['id'], timeout_min=run.get('timeout_min'), started=run.get('started'))
+                        broker_say(ctx, m['id'], 'request', 'started (after restart)', run['id'])
+                    else:
+                        broker_respond(inbox, stem, 'error', reason='broker stopped during hand-over – submit the request again. ' + BROKER_HALF)
+                        broker_say(ctx, folder.name, 'request', 'error (broker was stopped)', stem)
+                except OSError: pass
+            f.unlink()
+
+def broker_main():
+    """nc-work broker: one instance (flock without waiting on broker.lock), a loop in the foreground until Ctrl-C."""
+    lock = (STATE / 'broker.lock').open('a')
+    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError: raise ValueError('broker is already running')
+    ctx = Broker()
+    previous = broker_signals(ctx)
+    try:
+        broker_start(ctx)
+        print('Broker running (Ctrl-C stops it; a running call is waited for first).', flush=True)
+        while not broker_ending(ctx):  # a signal during a call that still ended normally: the call is answered, then the loop ends
+            for step in (broker_round, broker_poll, broker_sweep):
+                step(ctx)
+                if broker_ending(ctx): break
+            else: ctx.sleep(BROKER_ROUND)
+    except (KeyboardInterrupt, BrokerStop): pass
+    finally:
+        for sig, handler in previous.items(): signal.signal(sig, handler)
+    try: print('\nBroker stopped.', flush=True)
+    except OSError: pass
+
+def main():
+    os.umask(0o022)  # folders and files that a container's subuid reads (memory view, agents) do not depend on the caller
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('snapshot')
+    sub.add_parser('broker', help='nc delegate broker: takes the requests from the tasks\' mailboxes, runs in the foreground (herdr pane)')
+    c = sub.add_parser('profiles'); c.add_argument('--json', action='store_true', help='one JSON line: [{"id","path","github"}]')
+    sub.add_parser('list')
+    c = sub.add_parser('create'); c.add_argument('project'); c.add_argument('task'); c.add_argument('--offline', action='store_true')
+    c.add_argument('--worker', action='store_true', help='task for nc delegate: no memory mounts, record says worker')
+    c.add_argument('--from-task', metavar='REQUESTER', help='with --worker: start from the last commit of this task (checked first; exit 4 if refused)')
+    c = sub.add_parser('export', help='worker tasks: branch as DIR/repo.git, RESULT.md as DIR/RESULT.raw, DIR/export.json')
+    c.add_argument('task'); c.add_argument('--out', required=True)
+    for command in ['enter', 'status', 'stop', 'start', 'auth-check', 'github-check']:
+        c = sub.add_parser(command); c.add_argument('task')
+    c = sub.add_parser('auth-set'); c.add_argument('project', nargs='?')
+    c = sub.add_parser('auth-login'); c.add_argument('project', nargs='?')
+    c = sub.add_parser('auth-status'); c.add_argument('project')
+    c = sub.add_parser('publish'); c.add_argument('task'); c.add_argument('--push', action='store_true')
+    c = sub.add_parser('claude'); c.add_argument('task')
+    c = sub.add_parser('opencode', help='start OpenCode in a task with an OpenRouter key from secrets.env: OPENROUTER_API_KEY_CLIENTS '
+                           'if the project\'s policy denies free models, otherwise OPENROUTER_API_KEY')
+    c.add_argument('--stdin', action='store_true', help='pass piped input on to OpenCode')
+    c.add_argument('task'); c.add_argument('args', nargs=argparse.REMAINDER, help='passed to opencode, e.g. -- run --model ID "…"')
+    c = sub.add_parser('exec'); c.add_argument('task'); c.add_argument('command', nargs=argparse.REMAINDER)
+    c = sub.add_parser('here', help='pick or create a task for the project of this folder and start Claude or OpenCode')
+    c.add_argument('project', nargs='?')
+    c.add_argument('--runtime', choices=sorted(RUNTIMES), default='claude')
+    c = sub.add_parser('feed', help="usage data of an isolated Claude session, for herdr's usage cards")
+    c.add_argument('--pid', type=int, required=True); c.add_argument('--script', required=True)
+    c.add_argument('--since', default=''); c.add_argument('--orch', action='store_true', help="the orchestrator card's feed (usage.py --orch)")
+    c = sub.add_parser('memory-apply', help="write the tasks' memory requests into the shared memory (all tasks without names)")
+    c.add_argument('tasks', nargs='*')
+    c = sub.add_parser('remove', help='delete tasks (refuses if work is not on GitHub or memory requests wait)')
+    c.add_argument('tasks', nargs='+'); c.add_argument('--force', action='store_true', help='delete regardless, discards everything')
+    c.add_argument('--discard-memory', action='store_true', help='delete the task and drop its waiting or rejected memory requests; the work check stays')
+    c.add_argument('--discard-requests', action='store_true', help="delete the task and drop the requests waiting in its nc delegate mailbox; the work check stays")
+    c.add_argument('--delivered', metavar='SHA', help='worker tasks: delete without GitHub check if the branch is exactly SHA and the workspace is clean')
+    a = ap.parse_args()
+    if a.cmd == 'create' and a.from_task and not a.worker: raise ValueError('wrong call: --from-task only together with --worker')
+    STATE.mkdir(parents=True, exist_ok=True)
+    if a.cmd in ('create', 'start', 'snapshot'):
+        lock = (STATE / 'launcher.lock').open('a')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    if a.cmd == 'broker': broker_main(); return
+    if a.cmd == 'auth-status':
+        profile(a.project)
+        selected = token_path_for(a.project)
+        print(json.dumps({'project': a.project, 'configured': True, 'source': 'shared-default' if selected.name == '.default.token' else 'project-override'}))
+        return
+    if a.cmd == 'auth-login': auth_login(a.project); return
+    if a.cmd == 'auth-set': auth_set(a.project); return
+    if a.cmd == 'snapshot': print(snapshot()); return
+    if a.cmd == 'feed':
+        feed(a.pid, a.script, (['--orch'] if a.orch else []) + (['--since', a.since] if a.since else [])); return
+    if a.cmd == 'here':
+        lock = (STATE / 'launcher.lock').open('a')
+        here(a.project, lock, a.runtime); return
+    if a.cmd == 'memory-apply':
+        # Without names: never a worker (nc delegate), also if a record said memory.
+        names = a.tasks or sorted(f.stem for f in (STATE / 'tasks').glob('*.json')
+                                  if (t := task(f.stem)).get('memory') and not t.get('worker'))
+        failed = False
+        for name in names:
+            try: failed |= not memory_apply(task(name))
+            except (ValueError, FileNotFoundError) as exc: print('nc-work:', exc, file=sys.stderr); failed = True
+        if not names: print('no tasks with memory')
+        if failed: sys.exit(1)
+        return
+    if a.cmd == 'remove':
+        if a.delivered is not None:
+            if a.force or a.discard_memory or a.discard_requests:
+                raise ValueError('wrong call: --delivered not with --force, --discard-memory or --discard-requests')
+            if len(a.tasks) != 1: raise ValueError('wrong call: --delivered only with exactly one task')
+            if not re.fullmatch(r'[0-9a-f]{40}', a.delivered): raise ValueError('wrong call: --delivered needs a full commit (40 hex characters)')
+        failed = False
+        for name in a.tasks:
+            try: remove(name, a.force, a.discard_memory, a.delivered, a.discard_requests)
+            except ValueError as exc: print('nc-work:', exc, file=sys.stderr); failed = True
+        if failed: sys.exit(1)
+        return
+    if a.cmd == 'profiles':
+        if a.json:
+            print(json.dumps([{'id': p['id'], 'path': p['path'], 'github': p['github']}
+                              for p in sorted(all_profiles(), key=lambda p: p['id'])]))
+            return
+        for p in all_profiles(): print(p['id'], 'Node ' + p['node'], p['path'])
+        return
+    if a.cmd == 'list':
+        run('docker', 'ps', '-a', '--filter', f'label={LABEL}.kind=agent', '--format', 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'); return
+    if a.cmd == 'create':
+        try: create(profile(a.project), a.task, a.offline, worker=a.worker, from_task=a.from_task)
+        except Exception:
+            path = STATE / 'tasks' / (valid(a.task) + '.json')
+            if path.exists():
+                failed = json.loads(path.read_text())
+                if failed.get('status') == 'provisioning':
+                    failed['status'] = 'failed'; save(path, failed)
+                    for container in ['ncw-' + a.task, failed.get('proxy')]:
+                        if container: subprocess.run(['docker', 'stop', container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            raise
+        return
+    m = task(a.task)
+    if m.get('status', 'ready') != 'ready' and a.cmd not in ('status', 'stop'):
+        raise ValueError('Task provisioning did not complete; inspect status before recovery')
+    if a.cmd == 'publish': publish(m, a.push)
+    elif a.cmd == 'export': export(m, a.out)
+    elif a.cmd == 'claude': claude(m)
+    elif a.cmd == 'opencode': opencode(m, a.args[1:] if a.args[:1] == ['--'] else a.args, a.stdin)
+    elif a.cmd == 'enter': dex(a.task, '/bin/bash', interactive=True)
+    elif a.cmd == 'exec':
+        command = a.command[1:] if a.command[:1] == ['--'] else a.command
+        if not command: raise ValueError('Command required')
+        dex(a.task, *command)
+    elif a.cmd == 'status':
+        print(json.dumps(m, indent=2))
+        if m['proxy']: run('docker', 'port', m['proxy'])
+    elif a.cmd == 'stop':
+        run('docker', 'stop', 'ncw-' + a.task)
+        if m['proxy']: run('docker', 'stop', m['proxy'])
+        keyproxy_sweep(a.task)
+    elif a.cmd == 'start':
+        if len(output('docker', 'ps', '-q', '--filter', f'label={LABEL}.kind=agent').splitlines()) >= 3:
+            raise ValueError('Three tasks already running')
+        if m.get('agents'): agents_folders(a.task)  # a missing bind source would stop docker start
+        if m.get('broker'): broker_folders(a.task)
+        if m['proxy']: run('docker', 'start', m['proxy'])
+        run('docker', 'start', 'ncw-' + a.task)
+    elif a.cmd == 'auth-check':
+        # Report presence only. Never print CLI account fields or token contents.
+        result = dex(a.task, '/usr/bin/python3', '-I', '-B', '-c',
+            'import os,pathlib,json,sys; print(json.dumps({"host_ssh": pathlib.Path(sys.argv[1]).exists(), "claude_credentials": pathlib.Path("/home/agent/.claude/.credentials.json").exists(), "model_token": bool(os.getenv("CLAUDE_CODE_OAUTH_TOKEN")), "github_token": bool(os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN"))}))',
+            pathlib.Path.home() / '.ssh', capture=True)
+        print(result.stdout.decode().strip())
+    elif a.cmd == 'github-check':
+        p = profile(m['project'])
+        # Read-only authentication check from trusted host, fixed repository, never in container.
+        remote = github_remote(p)
+        result = output('git', '-c', 'core.hooksPath=/dev/null', 'ls-remote', remote, 'HEAD')
+        print(json.dumps({'repository': p['github'], 'authenticated_host_read': bool(result), 'credentials_in_container': False}))
+
+if __name__ == '__main__':
+    try: main()
+    except TooManyTasks as exc:
+        print('nc-work:', str(exc), file=sys.stderr); sys.exit(3)
+    except Refused as exc:
+        print('nc-work:', str(exc), file=sys.stderr); sys.exit(4)
+    except (ValueError, FileNotFoundError, subprocess.CalledProcessError) as exc:
+        print('nc-work:', str(exc), file=sys.stderr); sys.exit(1)
+    except KeyboardInterrupt:
+        print(file=sys.stderr); sys.exit(130)
