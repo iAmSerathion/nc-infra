@@ -50,7 +50,7 @@ Tasks with a mailbox for `nc delegate` (see "Broker") also have `~/.local/share/
 
 ## Profiles
 
-A profile is one JSON file per project: `id`, folder below `~/projects` (`path`), GitHub repository, Node version, package manager, preview ports, allowed internet targets, protected branches and limits. `nc-work` reads `~/.nc/overlay/profiles/` first and then `work-environments/profiles/`; a profile in the overlay wins on the same id, and `nc-work profiles` lists both. The shipped profiles are examples:
+A profile is one JSON file per project: `id`, folder below `~/projects` (`path`), GitHub repository, Node version, package manager, preview ports, allowed internet targets and protected branches. A `limits` entry is descriptive only: every task gets 2 CPUs, 4 GiB RAM and 512 processes, fixed in `bin/nc-work`. `nc-work` reads `~/.nc/overlay/profiles/` first and then `work-environments/profiles/`; a profile in the overlay wins on the same id, and `nc-work profiles` lists both. The shipped profiles are examples:
 
 | Profile | Node | Tools / preview ports in the container |
 | --- | --- | --- |
@@ -67,10 +67,10 @@ External databases are not assigned. Local Postgres/Redis services (`local_servi
 
 ## Private preview
 
-`nc-work status TASK` shows the ports actually assigned. Example: the output `3000/tcp -> 127.0.0.1:32771` means, on the Mac:
+`nc-work status TASK` shows the ports actually assigned. Example: the output `3000/tcp -> 127.0.0.1:32771` means, on your laptop (`<server>` is the server's SSH host name, see `vps-setup.md`):
 
 ```sh
-ssh -N -L 8080:127.0.0.1:32771 myserver
+ssh -N -L 8080:127.0.0.1:32771 <server>
 ```
 
 Then open `http://localhost:8080`. Take the port number from the actual output. The development server in the container must listen on `0.0.0.0`; on the server the forwarding is bound to `127.0.0.1` only. The fixed preview relay leads only to the matching agent container. No public domain is set up.
@@ -79,7 +79,7 @@ Then open `http://localhost:8080`. Take the port number from the actual output. 
 
 New tasks use the snapshot named in `~/.local/share/nc-work/harness-current.json`: a read-only copy of a committed nc-harness checkout under `~/.local/share/nc-work/harness/<tag>`, mounted at `/opt/nc-harness`.
 
-`nc-work snapshot` takes `git archive` of the harness HEAD (refused while the checkout has uncommitted changes) and adds the overlay's `AGENTS.md` and `models.yaml` from `~/.nc/overlay`, if they exist, over the public defaults. Only those two files of the overlay reach a container; profiles, docs and anything else stay on the host. Each must be a regular file, not a link, at most 256 KiB, and committed if the overlay is a Git checkout; otherwise the snapshot is refused. The tag is the harness commit, plus `-<12 hex>` of a SHA-256 over the overlay files when there are any, so a changed overlay gives a new snapshot. The copy is built in `<tag>.tmp` and then renamed. Policy decisions on the host (the key, the agent files) always read the live host checkout and overlay, never the snapshot.
+`nc-work snapshot` takes `git archive` of the harness HEAD (refused while the checkout has uncommitted changes) and adds the overlay's `AGENTS.md` (optional) and `models.yaml` from `~/.nc/overlay` over the public defaults. If `~/.nc/overlay` exists, `models.yaml` is required: an overlay without it is refused. Only those two files of the overlay reach a container; profiles, docs and anything else stay on the host. Each must be a regular file, not a link, at most 256 KiB, and committed if the overlay is a Git checkout; otherwise the snapshot is refused. The tag is the harness commit, plus `-<12 hex>` of a SHA-256 over the overlay files when there are any, so a changed overlay gives a new snapshot. The copy is built in `<tag>.tmp` and then renamed. Policy decisions on the host (the key, the agent files) always read the live host checkout and overlay, never the snapshot.
 
 The start script links the rules for Claude and OpenCode (`~/.claude/CLAUDE.md`, `~/.config/opencode/AGENTS.md`), `~/.claude/skills` as a whole to `/opt/nc-harness/skills` (OpenCode reads skills there too), the OpenCode configuration `adapters/opencode/opencode.json`, and `service.json` and `nc`. The subagents do not come from the snapshot but from their own mounts (see "Subagents and orchestrator"). The harness therefore never gets a top-level folder `agents`: an image built from an older `images/entrypoint` would link it to `~/.claude/agents`, where the read-only mount sits, and every new container would fail at start. In `images/entrypoint`, `agents` is taken out of the loop. Personal skills from the host home are not taken over. `nc doctor` recognizes the container by `NC_HARNESS_VERSION` and checks there only what must hold in the container.
 
